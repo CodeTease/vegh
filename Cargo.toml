@@ -1,0 +1,41 @@
+[package]
+name = "vegh"
+version = "0.1.0" 
+edition = "2024"
+authors = ["CodeTease"]
+description = "A lightweight, fast snapshot tool for developers."
+
+[dependencies]
+# CLI Parser - The interface of Vegh
+clap = { version = "4.4", features = ["derive"] }
+
+# Error Handling - Don't panic, handle it gracefully
+anyhow = "1.0"
+
+# Async Runtime - Reduced features for faster build times
+# We only need multi-thread runtime, macros, fs, and IO utilities.
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+
+# File System Walking & Ignoring - Find files, respect .veghignore
+ignore = "0.4"
+
+# Compression - Zstd power (Fast & Efficient)
+zstd = "0.13"
+
+# Tarball - Packaging utility
+tar = "0.4"
+
+# Hashing - Integrity check
+sha2 = "0.10"
+hex = "0.4"
+
+# HTTP Client - Optimized for CodeTease
+# - default-features = false: Removes OpenSSL (slow compile) and bloat
+# - rustls-tls: Uses Rust-native TLS (faster compile, easier cross-platform)
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
+futures = "0.3" # For concurrent chunk uploads
+
+# UI/UX - Adding some colors and style
+console = "0.16.1"
+indicatif = "0.18.3" # Progress bar
+colored = "3.0.0"
