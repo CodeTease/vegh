@@ -1,3 +1,3 @@
 # Vegh
 
-**IN DEVELOPMENT STAGE.**
+This is the main source code for the project **Vegh**. 

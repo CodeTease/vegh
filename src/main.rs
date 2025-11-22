@@ -7,11 +7,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Read, SeekFrom}; // Trait 'Seek' removed to satisfy Cargo
+use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::fs::File as AsyncFile;
-use tokio::io::{AsyncReadExt, AsyncSeekExt}; // AsyncSeekExt is needed for seek()
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// 🥬 Vegh - The CodeTease Snapshot Tool
 /// "Tight packing, swift unpacking, no nonsense."
@@ -61,6 +61,10 @@ enum Commands {
         /// Force chunking regardless of file size
         #[arg(long)]
         force_chunk: bool,
+
+        /// Optional authentication token (sent as Bearer token)
+        #[arg(long)]
+        auth: Option<String>,
     },
 }
 
@@ -103,8 +107,8 @@ async fn main() -> Result<()> {
 
             println!("{} Integrity verified! SHA256: {}", "✅".green(), hash);
         }
-        Commands::Send { file, url, force_chunk } => {
-            send_file(&file, &url, force_chunk).await?;
+        Commands::Send { file, url, force_chunk, auth } => {
+            send_file(&file, &url, force_chunk, auth).await?;
             println!("{} Transfer complete! Took {:.2?}", "🚀".green(), start_time.elapsed());
         }
     }
@@ -127,7 +131,6 @@ fn create_snap(source: &Path, output: &Path) -> Result<()> {
     let pb = ProgressBar::new_spinner();
     pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
 
-    // --- FIX: Initialize count BEFORE processing .veghignore ---
     let mut count = 0;
 
     // Explicitly add .veghignore first
@@ -140,7 +143,6 @@ fn create_snap(source: &Path, output: &Path) -> Result<()> {
         tar.append_file(ignore_filename, &mut f)
             .context("Failed to add .veghignore to archive")?;
         
-        // --- FIX: Increment count for the config file ---
         count += 1;
     }
 
@@ -217,7 +219,7 @@ fn check_integrity(input: &Path) -> Result<String> {
 const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
 const CHUNK_SIZE: usize = 10 * 1024 * 1024;     // 10MB per chunk
 
-async fn send_file(path: &Path, url: &str, force_chunk: bool) -> Result<()> {
+async fn send_file(path: &Path, url: &str, force_chunk: bool, auth_token: Option<String>) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("File not found: {}", path.display());
     }
@@ -228,17 +230,21 @@ async fn send_file(path: &Path, url: &str, force_chunk: bool) -> Result<()> {
 
     println!("{} Target: {}", "🌐".cyan(), url);
     println!("{} File: {} ({:.2} MB)", "📄".cyan(), filename, file_size as f64 / 1024.0 / 1024.0);
+    
+    if let Some(_) = &auth_token {
+        println!("{} Authentication: Enabled", "🔒".green());
+    }
 
     if file_size < CHUNK_THRESHOLD && !force_chunk {
         println!("{} Mode: Direct Upload", "⚡".yellow());
-        send_direct(path, url, file_size).await
+        send_direct(path, url, file_size, auth_token).await
     } else {
         println!("{} Mode: Concurrent Chunked Upload", "📦".yellow());
-        send_chunked(path, url, file_size, &filename).await
+        send_chunked(path, url, file_size, &filename, auth_token).await
     }
 }
 
-async fn send_direct(path: &Path, url: &str, file_size: u64) -> Result<()> {
+async fn send_direct(path: &Path, url: &str, file_size: u64, auth_token: Option<String>) -> Result<()> {
     let client = Client::new();
     let mut file = AsyncFile::open(path).await?;
     let mut buffer = Vec::with_capacity(file_size as usize);
@@ -252,10 +258,14 @@ async fn send_direct(path: &Path, url: &str, file_size: u64) -> Result<()> {
 
     pb.set_message("Uploading...");
     
-    let response = client.post(url)
-        .body(buffer)
-        .send()
-        .await?;
+    let mut request = client.post(url);
+
+    // Add Authorization header if token is provided
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", format!("Bearer {}", token));
+    }
+
+    let response = request.body(buffer).send().await?;
 
     if response.status().is_success() {
         pb.finish_with_message("Upload success!");
@@ -271,7 +281,7 @@ async fn send_direct(path: &Path, url: &str, file_size: u64) -> Result<()> {
     }
 }
 
-async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str) -> Result<()> {
+async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, auth_token: Option<String>) -> Result<()> {
     let chunk_size = CHUNK_SIZE as u64;
     let total_chunks = (file_size + chunk_size - 1) / chunk_size;
     
@@ -292,6 +302,7 @@ async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str) ->
             let path = path.to_path_buf();
             let filename = filename.to_string();
             let pb = pb.clone();
+            let auth_token = auth_token.clone(); // Clone token for the async block
 
             async move {
                 let start = i * chunk_size;
@@ -307,13 +318,17 @@ async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str) ->
                 let mut buffer = vec![0u8; current_chunk_size];
                 file.read_exact(&mut buffer).await.context("Failed to read chunk")?;
 
-                let response = client.post(&url)
+                let mut request = client.post(&url)
                     .header("X-File-Name", &filename)
                     .header("X-Chunk-Index", i.to_string())
-                    .header("X-Total-Chunks", total_chunks.to_string())
-                    .body(buffer)
-                    .send()
-                    .await;
+                    .header("X-Total-Chunks", total_chunks.to_string());
+
+                // Add Authorization header to each chunk request
+                if let Some(token) = &auth_token {
+                    request = request.header("Authorization", format!("Bearer {}", token));
+                }
+
+                let response = request.body(buffer).send().await;
 
                 match response {
                     Ok(res) => {
