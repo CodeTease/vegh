@@ -2,22 +2,25 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use futures::stream::{self, StreamExt};
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
-use std::fs::File;
-use std::io::{Read, SeekFrom};
+use std::fs::{self, File};
+use std::io::{Read, SeekFrom}; // Kept Seek/SeekFrom for file ops, removed unused Write
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use serde::{Serialize, Deserialize};
+use chrono::Utc;
+
+// Files that should ALWAYS be included
+const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
 
 /// 🥬 Vegh - The CodeTease Snapshot Tool
-/// "Tight packing, swift unpacking, no nonsense."
 #[derive(Parser)]
 #[command(name = "vegh")]
-#[command(about = "The ultimate snapshot tool by CodeTease", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -25,47 +28,57 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 📸 Create a snapshot (.snap) from a directory
+    /// 📸 Create a snapshot (.snap)
     Snap {
-        /// Path to the source directory
         #[arg(default_value = ".")]
         path: PathBuf,
-
-        /// Output file name (default: <folder_name>.snap)
         #[arg(short, long)]
         output: Option<PathBuf>,
-    },
-    /// 📦 Restore a snapshot (.snap)
-    Restore {
-        /// The .snap file to restore
-        file: PathBuf,
+        #[arg(short = 'l', long, default_value_t = 3)]
+        level: i32,
+        #[arg(long)]
+        comment: Option<String>,
 
-        /// Destination directory (optional, default: current directory)
-        /// Example: vegh restore my-project.snap ./output-folder
+        /// Include files (force add, bypass ignore)
+        #[arg(short = 'i', long)]
+        include: Vec<String>,
+
+        /// Exclude files (force ignore)
+        #[arg(short = 'e', long)]
+        exclude: Vec<String>,
+    },
+    /// 📦 Restore a snapshot
+    Restore {
+        file: PathBuf,
         #[arg(default_value = ".")]
         out_dir: PathBuf,
     },
-    /// ✅ Verify the integrity of a .snap file
-    Check {
-        /// The .snap file to verify
+    /// 📜 List files
+    List {
         file: PathBuf,
     },
-    /// 🚀 Send a snapshot to a remote server
-    Send {
-        /// The file to send
+    /// ✅ Verify integrity
+    Check {
         file: PathBuf,
-
-        /// The target URL to receive the file
+    },
+    /// 🚀 Send to server
+    Send {
+        file: PathBuf,
         url: String,
-
-        /// Force chunking regardless of file size
         #[arg(long)]
         force_chunk: bool,
-
-        /// Optional authentication token (sent as Bearer token)
         #[arg(long)]
         auth: Option<String>,
     },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct VeghMetadata {
+    author: String,
+    timestamp: i64,
+    timestamp_human: String,
+    comment: String,
+    tool_version: String,
 }
 
 #[tokio::main]
@@ -74,151 +87,207 @@ async fn main() -> Result<()> {
     let start_time = Instant::now();
 
     match cli.command {
-        Commands::Snap { path, output } => {
-            // Determine output filename
-            let folder_name = path
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("backup"))
-                .to_string_lossy()
-                .to_string();
-            let output_path = output.unwrap_or_else(|| PathBuf::from(format!("{}.snap", folder_name)));
-
-            println!("{} Packing '{}' into '{}'...", "⚙️".cyan(), path.display(), output_path.display());
-
-            // Run blocking IO/CPU tasks in a separate thread
-            let task = tokio::task::spawn_blocking(move || create_snap(&path, &output_path));
+        Commands::Snap { path, output, level, comment, include, exclude } => {
+            let folder_name = path.file_name().unwrap_or(std::ffi::OsStr::new("backup")).to_string_lossy();
+            let output_path = output.unwrap_or(PathBuf::from(format!("{}.snap", folder_name)));
+            
+            println!("{} Packing '{}' -> '{}'", "⚙️".cyan(), path.display(), output_path.display());
+            
+            let task = tokio::task::spawn_blocking(move || 
+                create_snap(&path, &output_path, level, comment, include, exclude)
+            );
             task.await??;
-
-            println!("{} Done! Took {:.2?}", "✨".green(), start_time.elapsed());
+            println!("{} Done! ({:.2?})", "✨".green(), start_time.elapsed());
         }
         Commands::Restore { file, out_dir } => {
-            println!("{} Restoring '{}' to '{}'...", "⚙️".cyan(), file.display(), out_dir.display());
-
+            println!("{} Restoring '{}'...", "⚙️".cyan(), file.display());
             let task = tokio::task::spawn_blocking(move || restore_snap(&file, &out_dir));
             task.await??;
-
-            println!("{} Done! Took {:.2?}", "✨".green(), start_time.elapsed());
+            println!("{} Done! ({:.2?})", "✨".green(), start_time.elapsed());
+        }
+        Commands::List { file } => {
+            let task = tokio::task::spawn_blocking(move || list_snap(&file));
+            task.await??;
         }
         Commands::Check { file } => {
-            println!("{} Inspecting '{}'...", "🔍".yellow(), file.display());
-            
+            println!("{} Checking '{}'...", "🔍".yellow(), file.display());
             let task = tokio::task::spawn_blocking(move || check_integrity(&file));
-            let hash = task.await??;
-
-            println!("{} Integrity verified! SHA256: {}", "✅".green(), hash);
+            let (hash, meta) = task.await??;
+            
+            println!("{} Integrity OK!", "✅".green());
+            println!("   SHA256: {}", hash.dimmed());
+            if let Some(m) = meta {
+                println!("\n{} Metadata:", "🏷️".blue());
+                println!("   Author:  {}", m.author.cyan());
+                println!("   Time:    {}", m.timestamp_human.yellow());
+                if !m.comment.is_empty() { println!("   Comment: {}", m.comment.italic()); }
+            } else {
+                println!("\n{} No metadata (legacy/raw archive).", "⚠️".yellow());
+            }
         }
         Commands::Send { file, url, force_chunk, auth } => {
             send_file(&file, &url, force_chunk, auth).await?;
-            println!("{} Transfer complete! Took {:.2?}", "🚀".green(), start_time.elapsed());
+            println!("{} Sent! ({:.2?})", "🚀".green(), start_time.elapsed());
         }
     }
-
     Ok(())
 }
 
-// --- CORE LOGIC ---
+fn create_snap(
+    source: &Path, 
+    output: &Path, 
+    level: i32, 
+    comment: Option<String>,
+    include: Vec<String>,
+    exclude: Vec<String>
+) -> Result<()> {
+    let file = File::create(output).context("Output file creation failed")?;
+    let output_abs = fs::canonicalize(output).unwrap_or(output.to_path_buf());
 
-/// Snapshot creation logic
-fn create_snap(source: &Path, output: &Path) -> Result<()> {
-    let file = File::create(output).context("Failed to create output file")?;
-    
-    // Zstd Encoder: Default compression level is 3 (Balanced).
-    let encoder = zstd::stream::write::Encoder::new(file, 3)?;
-    
-    // Tar Builder wraps Zstd Encoder
+    let meta = VeghMetadata {
+        author: "CodeTease".to_string(),
+        timestamp: Utc::now().timestamp(),
+        timestamp_human: Utc::now().to_rfc3339(),
+        comment: comment.unwrap_or_default(),
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let meta_json = serde_json::to_string_pretty(&meta)?;
+
+    let encoder = zstd::stream::write::Encoder::new(file, level)?;
     let mut tar = tar::Builder::new(encoder);
+
+    // Meta (Hidden)
+    let mut header = tar::Header::new_gnu();
+    header.set_path(".vegh.json")?;
+    header.set_size(meta_json.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, ".vegh.json", meta_json.as_bytes())?;
 
     let pb = ProgressBar::new_spinner();
     pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap());
-
     let mut count = 0;
 
-    // Explicitly add .veghignore first
-    let ignore_filename = ".veghignore";
-    let ignore_path = source.join(ignore_filename);
-    
-    if ignore_path.exists() && ignore_path.is_file() {
-        pb.set_message(format!("Preserving config: {}", ignore_filename));
-        let mut f = File::open(&ignore_path).context("Failed to open .veghignore")?;
-        tar.append_file(ignore_filename, &mut f)
-            .context("Failed to add .veghignore to archive")?;
-        
-        count += 1;
-    }
-
-    // Configure walker to respect .veghignore rules for OTHER files
-    let mut builder = WalkBuilder::new(source);
-    builder.add_custom_ignore_filename(ignore_filename);
-    builder.hidden(true); // Ignore hidden files (dotfiles) by default
-    builder.git_ignore(true); 
-
-    let walker = builder.build();
-
-    for result in walker {
-        match result {
-            Ok(entry) => {
-                let path = entry.path();
-                if path.is_file() {
-                    let name = path.strip_prefix(source).unwrap_or(path);
-                    let name_str = name.to_string_lossy();
-
-                    // Avoid adding .veghignore twice if the walker somehow picks it up
-                    if name_str == ignore_filename {
-                        continue;
-                    }
-
-                    pb.set_message(format!("Compressing: {}", name.display()));
-                    tar.append_path_with_name(path, name)
-                        .with_context(|| format!("Failed to add file: {}", path.display()))?;
-                    count += 1;
-                }
-            }
-            Err(err) => eprintln!("{} Error reading file: {}", "⚠️".red(), err),
+    // Preserved Files (VIPs)
+    for &filename in PRESERVED_FILES {
+        let p = source.join(filename);
+        if p.exists() && p.is_file() {
+            let mut f = File::open(&p)?;
+            tar.append_file(filename, &mut f)?;
+            count += 1;
         }
     }
 
-    pb.finish_with_message(format!("Compressed {} files.", count));
+    // Override Logic (Silent)
+    let mut override_builder = OverrideBuilder::new(source);
     
-    let encoder = tar.into_inner()?;
-    encoder.finish()?;
-
-    Ok(())
-}
-
-/// Snapshot restoration logic
-fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
-    let file = File::open(input).context("Failed to find .snap file")?;
-    let decoder = zstd::stream::read::Decoder::new(file)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(out_dir).context("Failed to unpack archive")?;
-    Ok(())
-}
-
-/// Integrity check logic
-fn check_integrity(input: &Path) -> Result<String> {
-    let mut file = File::open(input).context("Failed to open file for checking")?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0; 8192];
-
-    let pb = ProgressBar::new_spinner();
-    pb.set_message("Calculating checksum...");
-
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 { break; }
-        hasher.update(&buffer[..count]);
+    for pattern in include {
+        let _ = override_builder.add(&format!("!{}", pattern));
+    }
+    for pattern in exclude {
+        let _ = override_builder.add(&pattern);
     }
 
-    let result = hasher.finalize();
-    pb.finish_and_clear();
-    Ok(hex::encode(result))
+    let overrides = override_builder.build().context("Failed to build override rules")?;
+
+    let mut builder = WalkBuilder::new(source);
+    for &f in PRESERVED_FILES { builder.add_custom_ignore_filename(f); }
+    
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .overrides(overrides); 
+    
+    for result in builder.build() {
+        if let Ok(entry) = result {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(abs) = fs::canonicalize(path) { if abs == output_abs { continue; } }
+                let name = path.strip_prefix(source).unwrap_or(path);
+                if PRESERVED_FILES.contains(&name.to_string_lossy().as_ref()) { continue; }
+                
+                pb.set_message(format!("Packing: {}", name.display()));
+                tar.append_path_with_name(path, name)?;
+                count += 1;
+            }
+        }
+    }
+    pb.finish_with_message(format!("Packed {} files.", count));
+
+    let zstd_encoder = tar.into_inner()?;
+    zstd_encoder.finish()?;
+    
+    Ok(())
 }
 
-// --- NETWORK LOGIC ---
+fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
+    if !out_dir.exists() { fs::create_dir_all(out_dir)?; }
+    
+    let file = File::open(input).context("Open failed")?;
+    let decoder = zstd::stream::read::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
 
-const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
-const CHUNK_SIZE: usize = 10 * 1024 * 1024;     // 10MB per chunk
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path.to_string_lossy() == ".vegh.json" { continue; }
+        entry.unpack_in(out_dir)?;
+    }
+    Ok(())
+}
 
+fn list_snap(input: &Path) -> Result<()> {
+    let file = File::open(input).context("Open failed")?;
+    let decoder = zstd::stream::read::Decoder::new(file)?;
+    let mut archive = tar::Archive::new(decoder);
+
+    println!("{} Contents of {}:", "📂".cyan(), input.display());
+    println!("{:-<50}", "-");
+    
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        if path.to_string_lossy() == ".vegh.json" {
+            println!("{} (Metadata)", ".vegh.json".dimmed());
+        } else {
+            println!("{:<40} {:>8} bytes", path.display(), entry.size());
+        }
+    }
+    Ok(())
+}
+
+fn check_integrity(input: &Path) -> Result<(String, Option<VeghMetadata>)> {
+    let mut f = File::open(input)?;
+    let mut sha = Sha256::new();
+    std::io::copy(&mut f, &mut sha)?;
+    let hash = hex::encode(sha.finalize());
+
+    // Try to read meta
+    let file = File::open(input)?;
+    let meta = if let Ok(d) = zstd::stream::read::Decoder::new(file) {
+        let mut ar = tar::Archive::new(d);
+        ar.entries()
+            .ok()
+            .and_then(|mut entries| {
+                entries.find_map(|e| {
+                    let mut entry = e.ok()?;
+                    if entry.path().ok()?.to_string_lossy() == ".vegh.json" {
+                        let mut s = String::new();
+                        entry.read_to_string(&mut s).ok()?;
+                        serde_json::from_str(&s).ok()
+                    } else {
+                        None
+                    }
+                })
+            })
+    } else {
+        None
+    };
+
+    Ok((hash, meta))
+}
+
+// Chunked Upload Logic
 async fn send_file(path: &Path, url: &str, force_chunk: bool, auth_token: Option<String>) -> Result<()> {
     if !path.exists() {
         anyhow::bail!("File not found: {}", path.display());
@@ -235,6 +304,8 @@ async fn send_file(path: &Path, url: &str, force_chunk: bool, auth_token: Option
         println!("{} Authentication: Enabled", "🔒".green());
     }
 
+    const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
+    
     if file_size < CHUNK_THRESHOLD && !force_chunk {
         println!("{} Mode: Direct Upload", "⚡".yellow());
         send_direct(path, url, file_size, auth_token).await
@@ -260,7 +331,6 @@ async fn send_direct(path: &Path, url: &str, file_size: u64, auth_token: Option<
     
     let mut request = client.post(url);
 
-    // Add Authorization header if token is provided
     if let Some(token) = auth_token {
         request = request.header("Authorization", format!("Bearer {}", token));
     }
@@ -269,11 +339,8 @@ async fn send_direct(path: &Path, url: &str, file_size: u64, auth_token: Option<
 
     if response.status().is_success() {
         pb.finish_with_message("Upload success!");
-        
-        // Print Response Body
         let response_text = response.text().await.unwrap_or_else(|_| "No response text".to_string());
         println!("\n{} Server Response:\n{}", "📩".blue(), response_text.dimmed());
-        
         Ok(())
     } else {
         pb.abandon();
@@ -282,8 +349,9 @@ async fn send_direct(path: &Path, url: &str, file_size: u64, auth_token: Option<
 }
 
 async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, auth_token: Option<String>) -> Result<()> {
-    let chunk_size = CHUNK_SIZE as u64;
-    let total_chunks = (file_size + chunk_size - 1) / chunk_size;
+    const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
+    let chunk_size_u64 = CHUNK_SIZE as u64;
+    let total_chunks = (file_size + chunk_size_u64 - 1) / chunk_size_u64;
     
     let pb = ProgressBar::new(total_chunks);
     pb.set_style(ProgressStyle::default_bar()
@@ -292,7 +360,6 @@ async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, au
         .progress_chars("█▒░"));
 
     let client = Client::new();
-    
     let chunks: Vec<u64> = (0..total_chunks).collect();
 
     let stream = stream::iter(chunks)
@@ -302,14 +369,12 @@ async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, au
             let path = path.to_path_buf();
             let filename = filename.to_string();
             let pb = pb.clone();
-            let auth_token = auth_token.clone(); // Clone token for the async block
+            let auth_token = auth_token.clone();
 
             async move {
-                let start = i * chunk_size;
-                let mut end = start + chunk_size;
-                if end > file_size {
-                    end = file_size;
-                }
+                let start = i * chunk_size_u64;
+                let mut end = start + chunk_size_u64;
+                if end > file_size { end = file_size; }
                 let current_chunk_size = (end - start) as usize;
 
                 let mut file = AsyncFile::open(&path).await.context("Failed to open file")?;
@@ -323,14 +388,11 @@ async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, au
                     .header("X-Chunk-Index", i.to_string())
                     .header("X-Total-Chunks", total_chunks.to_string());
 
-                // Add Authorization header to each chunk request
                 if let Some(token) = &auth_token {
                     request = request.header("Authorization", format!("Bearer {}", token));
                 }
 
-                let response = request.body(buffer).send().await;
-
-                match response {
+                match request.body(buffer).send().await {
                     Ok(res) => {
                         if res.status().is_success() {
                             pb.inc(1);
@@ -339,18 +401,15 @@ async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, au
                             Err(anyhow::anyhow!("Chunk {} failed: {}", i, res.status()))
                         }
                     }
-                    Err(e) => Err(anyhow::anyhow!("Network error on chunk {}: {}", i, e)),
+                    Err(e) => Err(anyhow::anyhow!("Network error chunk {}: {}", i, e)),
                 }
             }
         })
-        .buffer_unordered(4);
+        .buffer_unordered(4); // Process 4 chunks concurrently
 
     let results: Vec<Result<()>> = stream.collect().await;
-
     for res in results {
-        if let Err(e) = res {
-            anyhow::bail!("Upload incomplete. Error: {}", e);
-        }
+        if let Err(e) = res { anyhow::bail!("Upload incomplete. Error: {}", e); }
     }
 
     pb.finish_with_message("All chunks sent successfully!");

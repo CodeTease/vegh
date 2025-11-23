@@ -1,41 +1,43 @@
 [package]
 name = "vegh"
-version = "0.1.0" 
+version = "0.3.0" 
 edition = "2024"
 authors = ["CodeTease"]
 description = "A lightweight, fast snapshot tool for developers."
 
 [dependencies]
-# CLI Parser - The interface of Vegh
+# CLI Parser
 clap = { version = "4.4", features = ["derive"] }
 
-# Error Handling - Don't panic, handle it gracefully
+# Error Handling
 anyhow = "1.0"
 
-# Async Runtime - Reduced features for faster build times
-# We only need multi-thread runtime, macros, fs, and IO utilities.
+# Async Runtime
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
 
-# File System Walking & Ignoring - Find files, respect .veghignore
+# File System Walking
 ignore = "0.4"
 
-# Compression - Zstd power (Fast & Efficient)
+# Compression
 zstd = "0.13"
 
-# Tarball - Packaging utility
+# Tarball
 tar = "0.4"
 
-# Hashing - Integrity check
+# Hashing
 sha2 = "0.10"
 hex = "0.4"
 
-# HTTP Client - Optimized for CodeTease
-# - default-features = false: Removes OpenSSL (slow compile) and bloat
-# - rustls-tls: Uses Rust-native TLS (faster compile, easier cross-platform)
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
-futures = "0.3" # For concurrent chunk uploads
+# Metadata - JSON & Time
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
 
-# UI/UX - Adding some colors and style
+# HTTP Client
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
+futures = "0.3"
+
+# UI/UX
 console = "0.16.1"
-indicatif = "0.18.3" # Progress bar
+indicatif = "0.18.3"
 colored = "3.0.0"

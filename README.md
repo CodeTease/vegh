@@ -1,5 +1,4 @@
 # Vegh
 
-This is the main source code for the project **Vegh**. 
-
-> Devs are too lazy to write this, probably wait a bit!
+This is the main source code for the project **Vegh** to reference. 
+For production version, visit the official Python binding [PyVegh](https://github.com/CodeTease/pyvegh)
