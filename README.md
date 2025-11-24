@@ -1,4 +1,9 @@
 # Vegh
 
 This is the main source code for the project **Vegh** to reference. 
-For production version, visit the official Python binding [PyVegh](https://github.com/CodeTease/pyvegh)
+For production version, visit these official binding:
+* [PyVegh](https://github.com/CodeTease/pyvegh)
+* [VeghJS](https://github.com/CodeTease/veghjs)
+* VeghGo (Soon)
+
+Vegh stable version is v0.2.0, if you want to create binding, lock logic to 0.2.0 (Format version 1).

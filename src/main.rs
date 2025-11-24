@@ -7,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Read, SeekFrom}; // Kept Seek/SeekFrom for file ops, removed unused Write
+use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokio::fs::File as AsyncFile;
@@ -17,6 +17,9 @@ use chrono::Utc;
 
 // Files that should ALWAYS be included
 const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
+// [FIX] Đồng bộ Format Version với PyVegh.
+// Bump số này lên CHỈ KHI cấu trúc file .snap thay đổi.
+const SNAPSHOT_FORMAT_VERSION: &str = "1";
 
 /// 🥬 Vegh - The CodeTease Snapshot Tool
 #[derive(Parser)]
@@ -76,7 +79,9 @@ enum Commands {
 struct VeghMetadata {
     author: String,
     timestamp: i64,
-    timestamp_human: String,
+    // [FIX] Đánh dấu Option để tương thích ngược với các bản build cũ hoặc từ PyVegh (nếu thiếu)
+    #[serde(default)] 
+    timestamp_human: Option<String>, 
     comment: String,
     tool_version: String,
 }
@@ -119,7 +124,17 @@ async fn main() -> Result<()> {
             if let Some(m) = meta {
                 println!("\n{} Metadata:", "🏷️".blue());
                 println!("   Author:  {}", m.author.cyan());
-                println!("   Time:    {}", m.timestamp_human.yellow());
+                
+                // [FIX] Handle optional timestamp_human
+                if let Some(human_time) = m.timestamp_human {
+                    println!("   Time:    {}", human_time.yellow());
+                } else {
+                     // Fallback convert từ timestamp
+                    let dt = chrono::DateTime::<Utc>::from_timestamp(m.timestamp, 0).unwrap_or_default();
+                    println!("   Time:    {}", dt.to_rfc3339().yellow());
+                }
+
+                println!("   Format:  {}", m.tool_version.magenta()); // Hiển thị Format Version
                 if !m.comment.is_empty() { println!("   Comment: {}", m.comment.italic()); }
             } else {
                 println!("\n{} No metadata (legacy/raw archive).", "⚠️".yellow());
@@ -147,9 +162,10 @@ fn create_snap(
     let meta = VeghMetadata {
         author: "CodeTease".to_string(),
         timestamp: Utc::now().timestamp(),
-        timestamp_human: Utc::now().to_rfc3339(),
+        timestamp_human: Some(Utc::now().to_rfc3339()),
         comment: comment.unwrap_or_default(),
-        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        // [FIX] Sử dụng Format Version cố định thay vì Cargo Pkg Version
+        tool_version: SNAPSHOT_FORMAT_VERSION.to_string(),
     };
     let meta_json = serde_json::to_string_pretty(&meta)?;
 
