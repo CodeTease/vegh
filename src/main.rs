@@ -4,7 +4,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use colored::*;
 use futures::stream::{self, StreamExt};
-use ignore::{WalkBuilder, overrides::OverrideBuilder};
+use ignore::{overrides::OverrideBuilder, WalkBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::MmapOptions;
 use reqwest::Client;
@@ -14,8 +14,8 @@ use std::fs::{self, File};
 use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::{Instant, SystemTime};
 use tokio::fs::File as AsyncFile;
@@ -198,8 +198,8 @@ async fn main() -> Result<()> {
                 if let Some(human_time) = m.timestamp_human {
                     println!("   Time:    {}", human_time.yellow());
                 } else {
-                    let dt =
-                        chrono::DateTime::<Utc>::from_timestamp(m.timestamp, 0).unwrap_or_default();
+                    let dt = chrono::DateTime::<Utc>::from_timestamp(m.timestamp, 0)
+                        .unwrap_or_default();
                     println!("   Time:    {}", dt.to_rfc3339().yellow());
                 }
 
@@ -405,8 +405,8 @@ fn create_snap(
         if let Ok(entry) = result {
             let path = entry.path();
             if path.is_file() {
-                // [FIX] clippy::collapsible_if - Using map_or to avoid nesting
-                if fs::canonicalize(path).map_or(false, |abs| abs == output_abs) {
+                // [FIX] clippy::unnecessary_map_or - Use is_ok_and
+                if fs::canonicalize(path).is_ok_and(|abs| abs == output_abs) {
                     continue;
                 }
 
@@ -577,7 +577,6 @@ async fn send_file(
         file_size as f64 / 1024.0 / 1024.0
     );
 
-    // [FIX] clippy::redundant_pattern_matching - Use is_some()
     if auth_token.is_some() {
         println!("{} Authentication: Enabled", "🔒".green());
     }
@@ -689,9 +688,7 @@ async fn send_chunked(
                 }
                 let current_chunk_size = (end - start) as usize;
 
-                let mut file = AsyncFile::open(&path)
-                    .await
-                    .context("Failed to open file")?;
+                let mut file = AsyncFile::open(&path).await.context("Failed to open file")?;
                 file.seek(SeekFrom::Start(start))
                     .await
                     .context("Failed to seek")?;
