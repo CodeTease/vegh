@@ -63,7 +63,7 @@ echo "✅ Testing CHECK command..."
 echo "📦 Testing RESTORE command..."
 # Ensure the output directory is clean
 rm -rf "$RESTORE_DIR"
-"$VEGH_BIN" restore "$SNAP_FILE" --out_dir "$RESTORE_DIR"
+"$VEGH_BIN" restore "$SNAP_FILE" "$RESTORE_DIR"
 
 # 7. Verification: Compare Input and Output Data
 echo "🔍 Verifying Data Integrity..."
