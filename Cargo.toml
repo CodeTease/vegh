@@ -1,6 +1,6 @@
 [package]
 name = "vegh"
-version = "0.2.0" 
+version = "0.3.0" 
 edition = "2024"
 authors = ["CodeTease"]
 description = "A lightweight, fast snapshot tool for developers."
@@ -14,19 +14,28 @@ anyhow = "1.0"
 
 # Async Runtime
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+# [NEW] Needed for efficient streaming uploads
+tokio-util = { version = "0.7", features = ["codec", "io"] }
 
 # File System Walking
 ignore = "0.4"
 
+# Parallel Processing
+rayon = "1.10"
+
 # Compression
-zstd = "0.13"
+# [FIX] Added "zstdmt" feature to enable .multithread() method
+zstd = { version = "0.13", features = ["zstdmt"] }
 
 # Tarball
 tar = "0.4"
 
 # Hashing
-sha2 = "0.10"
+# [UPDATE] Replaced sha2 with blake3 for god-tier speed
+blake3 = { version = "1.5", features = ["rayon", "mmap"] }
 hex = "0.4"
+# Memmap needed for ultra-fast hashing of large files via OS memory mapping
+memmap2 = "0.9"
 
 # Metadata - JSON & Time
 serde = { version = "1.0", features = ["derive"] }
@@ -34,7 +43,7 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP Client
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "stream", "multipart"] }
 futures = "0.3"
 
 # UI/UX
