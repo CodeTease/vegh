@@ -4,7 +4,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use colored::*;
 use futures::stream::{self, StreamExt};
-use ignore::{overrides::OverrideBuilder, WalkBuilder};
+use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::MmapOptions;
 use reqwest::Client;
@@ -14,8 +14,8 @@ use std::fs::{self, File};
 use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Instant, SystemTime};
 use tokio::fs::File as AsyncFile;
@@ -198,8 +198,8 @@ async fn main() -> Result<()> {
                 if let Some(human_time) = m.timestamp_human {
                     println!("   Time:    {}", human_time.yellow());
                 } else {
-                    let dt = chrono::DateTime::<Utc>::from_timestamp(m.timestamp, 0)
-                        .unwrap_or_default();
+                    let dt =
+                        chrono::DateTime::<Utc>::from_timestamp(m.timestamp, 0).unwrap_or_default();
                     println!("   Time:    {}", dt.to_rfc3339().yellow());
                 }
 
@@ -247,11 +247,10 @@ fn load_cache(source: &Path) -> VeghCache {
     let cache_path = get_cache_path(source);
     if cache_path.exists() {
         // [FIX] clippy::collapsible_if - Combined check logic
-        if let Ok(file) = File::open(&cache_path) {
-            if let Ok(cache) = serde_json::from_reader(file) {
+        if let Ok(file) = File::open(&cache_path)
+            && let Ok(cache) = serde_json::from_reader(file) {
                 return cache;
             }
-        }
         println!("{} Cache corrupted. Cleaning...", "🧹".yellow());
         // Clean up corrupt cache to prevent future errors
         let _ = fs::remove_dir_all(source.join(CACHE_DIR));
@@ -689,7 +688,9 @@ async fn send_chunked(
                 }
                 let current_chunk_size = (end - start) as usize;
 
-                let mut file = AsyncFile::open(&path).await.context("Failed to open file")?;
+                let mut file = AsyncFile::open(&path)
+                    .await
+                    .context("Failed to open file")?;
                 file.seek(SeekFrom::Start(start))
                     .await
                     .context("Failed to seek")?;
