@@ -5,25 +5,24 @@ use futures::stream::{self, StreamExt};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
-// [UPDATE] Switched to Blake3
 use blake3::Hasher;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}}; // [NEW] For thread-safe flag
 use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio_util::codec::{BytesCodec, FramedRead}; // For Streaming
+use tokio_util::codec::{BytesCodec, FramedRead};
 use serde::{Serialize, Deserialize};
 use chrono::Utc;
-use memmap2::MmapOptions; // For zero-copy hashing
+use memmap2::MmapOptions;
 
 // Files that should ALWAYS be included
-const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore", ".dockerignore", ".npmignore"];
+const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
 
-// [STRICT] Format Version stays at 2.
-// FV 2 now encompasses: Multithreading, Caching, and Blake3 Hashing.
+// Format Version 2: Multithreading, Caching, Blake3
 const SNAPSHOT_FORMAT_VERSION: &str = "2";
 
 const CACHE_DIR: &str = ".veghcache";
@@ -66,7 +65,7 @@ enum Commands {
     List {
         file: PathBuf,
     },
-    /// ✅ Verify integrity (Now with Blake3)
+    /// ✅ Verify integrity
     Check {
         file: PathBuf,
     },
@@ -125,12 +124,17 @@ async fn main() -> Result<()> {
                 create_snap(&path, &output_path, level, comment, include, exclude, no_cache)
             );
             
-            // [NEW] Display Compression Ratio
-            let (raw_size, compressed_size) = task.await??;
-            let ratio = if compressed_size > 0 { raw_size as f64 / compressed_size as f64 } else { 0.0 };
-            
-            println!("{} Done! ({:.2?})", "✨".green(), start_time.elapsed());
-            println!("   Compression: {:.2}x ({} -> {})", ratio, format_bytes(raw_size), format_bytes(compressed_size));
+            match task.await? {
+                Ok((raw_size, compressed_size)) => {
+                    let ratio = if compressed_size > 0 { raw_size as f64 / compressed_size as f64 } else { 0.0 };
+                    println!("{} Done! ({:.2?})", "✨".green(), start_time.elapsed());
+                    println!("   Compression: {:.2}x ({} -> {})", ratio, format_bytes(raw_size), format_bytes(compressed_size));
+                },
+                Err(e) => {
+                    // This catches explicit errors, but simple interruption is handled inside create_snap
+                    eprintln!("{} Operation failed: {}", "❌".red(), e);
+                }
+            }
         }
         Commands::Restore { file, out_dir } => {
             println!("{} Restoring '{}'...", "⚙️".cyan(), file.display());
@@ -148,7 +152,7 @@ async fn main() -> Result<()> {
             let (hash, meta) = task.await??;
             
             println!("{} Integrity OK!", "✅".green());
-            println!("   BLAKE3: {}", hash.dimmed()); // Updated label
+            println!("   BLAKE3: {}", hash.dimmed());
             if let Some(m) = meta {
                 println!("\n{} Metadata:", "🏷️".blue());
                 println!("   Author:  {}", m.author.cyan());
@@ -175,15 +179,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Helper to format bytes nicely
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
     let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
+    while v >= 1024.0 && i < UNITS.len() - 1 { v /= 1024.0; i += 1; }
     format!("{:.2} {}", v, UNITS[i])
 }
 
@@ -213,7 +213,6 @@ fn save_cache(source: &Path, cache: &VeghCache) -> Result<()> {
     Ok(())
 }
 
-// Returns (Raw Size, Compressed Size)
 fn create_snap(
     source: &Path, 
     output: &Path, 
@@ -223,6 +222,16 @@ fn create_snap(
     exclude: Vec<String>,
     no_cache: bool
 ) -> Result<(u64, u64)> {
+    // [NEW] Setup Atomic flag for Ctrl+C detection
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    // Register handler. When Ctrl+C is pressed, 'running' becomes false.
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+        println!("\n{} Interrupted! Stopping gracefully...", "🛑".red());
+    }).expect("Error setting Ctrl-C handler");
+
     let mut cache = if no_cache {
         println!("{} Skipping cache (forced refresh)", "🔄".yellow());
         VeghCache::default()
@@ -287,6 +296,33 @@ fn create_snap(
     builder.hidden(true).git_ignore(true).overrides(overrides); 
     
     for result in builder.build() {
+        // [NEW] Check interruption flag at start of every iteration
+        if !running.load(Ordering::SeqCst) {
+            pb.finish_with_message("Interrupted!");
+            
+            // Save what we have processed so far
+            cache.files = new_cache_files; // This now contains entries processed UP TO the interruption
+            cache.last_snapshot = Utc::now().timestamp();
+            
+            println!("{} Saving partial cache...", "💾".yellow());
+            if let Err(e) = save_cache(source, &cache) {
+                println!("{} Failed to save partial cache: {}", "⚠️".red(), e);
+            } else {
+                println!("{} Partial cache saved. Next run will resume faster!", "✅".green());
+            }
+
+            // Clean up the incomplete snapshot file
+            println!("{} Cleaning up broken snapshot...", "🧹".yellow());
+            // Drop tar/encoder first to release file lock (Rust ownership)
+            drop(tar); 
+            if let Err(e) = fs::remove_file(output) {
+                println!("{} Failed to delete broken file: {}", "⚠️".red(), e);
+            }
+
+            // Return error to stop main process cleanly
+            return Err(anyhow::anyhow!("Process interrupted by user"));
+        }
+
         if let Ok(entry) = result {
             let path = entry.path();
             if path.is_file() {
@@ -339,9 +375,7 @@ fn create_snap(
     let zstd_encoder = tar.into_inner()?;
     zstd_encoder.finish()?;
     
-    // Calculate final file size
     let final_size = fs::metadata(output)?.len();
-    
     Ok((total_raw_size, final_size))
 }
 
@@ -377,26 +411,19 @@ fn list_snap(input: &Path) -> Result<()> {
     Ok(())
 }
 
-// [UPDATE] High-performance Integrity Check with BLAKE3 + Mmap + Rayon
 fn check_integrity(input: &Path) -> Result<(String, Option<VeghMetadata>)> {
     let file = File::open(input)?;
-    
-    // Try to memory map the file for max speed (zero-copy)
-    // If mmap fails (e.g. OS restrictions), fallback to standard read
     let hash = if let Ok(mmap) = unsafe { MmapOptions::new().map(&file) } {
-        // [RAYON] Blake3 update_rayon automatically uses multithreading for large inputs!
         let mut hasher = Hasher::new();
         hasher.update_rayon(&mmap);
         hasher.finalize().to_hex().to_string()
     } else {
-        // Fallback for systems without mmap support
         let mut f = File::open(input)?;
         let mut hasher = Hasher::new();
         std::io::copy(&mut f, &mut hasher)?;
         hasher.finalize().to_hex().to_string()
     };
 
-    // Try to read meta
     let file = File::open(input)?;
     let meta = if let Ok(d) = zstd::stream::read::Decoder::new(file) {
         let mut ar = tar::Archive::new(d);
@@ -436,14 +463,10 @@ async fn send_file(path: &Path, url: &str, force_chunk: bool, auth_token: Option
     }
 }
 
-// [UPDATE] True Streaming Upload (Low RAM usage)
 async fn send_streaming(path: &Path, url: &str, file_size: u64, auth_token: Option<String>) -> Result<()> {
     let client = Client::new();
     let file = AsyncFile::open(path).await?;
-    
-    // Create a stream from the file (chunked read)
     let stream = FramedRead::new(file, BytesCodec::new());
-    // Convert to reqwest Body
     let body = reqwest::Body::wrap_stream(stream);
 
     let pb = ProgressBar::new(file_size);
@@ -452,13 +475,10 @@ async fn send_streaming(path: &Path, url: &str, file_size: u64, auth_token: Opti
         .unwrap()
         .progress_chars("#>-"));
     
-    // Note: Reqwest async stream doesn't easily support progress callback *during* send 
-    // without wrapping the stream manually. For simplicity/stability, we just show spinner or start.
-    // (A full wrapped stream is possible but verbose for this snippet).
     pb.set_message("Streaming...");
 
     let mut request = client.post(url)
-        .header("Content-Length", file_size) // Good for R2/S3
+        .header("Content-Length", file_size)
         .header("User-Agent", "CodeTease-Vegh/0.3.0");
 
     if let Some(token) = auth_token {
@@ -478,7 +498,6 @@ async fn send_streaming(path: &Path, url: &str, file_size: u64, auth_token: Opti
     }
 }
 
-// ... send_chunked (giữ nguyên logic cũ, nó đã khá tối ưu cho file rất lớn)
 async fn send_chunked(path: &Path, url: &str, file_size: u64, filename: &str, auth_token: Option<String>) -> Result<()> {
     const CHUNK_SIZE: usize = 10 * 1024 * 1024; 
     let chunk_size_u64 = CHUNK_SIZE as u64;

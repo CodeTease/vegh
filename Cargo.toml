@@ -14,8 +14,11 @@ anyhow = "1.0"
 
 # Async Runtime
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
-# [NEW] Needed for efficient streaming uploads
 tokio-util = { version = "0.7", features = ["codec", "io"] }
+
+# Signal Handling (Ctrl+C)
+# [NEW] Added to handle graceful shutdowns and save cache
+ctrlc = "3.4"
 
 # File System Walking
 ignore = "0.4"
@@ -24,17 +27,14 @@ ignore = "0.4"
 rayon = "1.10"
 
 # Compression
-# [FIX] Added "zstdmt" feature to enable .multithread() method
 zstd = { version = "0.13", features = ["zstdmt"] }
 
 # Tarball
 tar = "0.4"
 
 # Hashing
-# [UPDATE] Replaced sha2 with blake3 for god-tier speed
 blake3 = { version = "1.5", features = ["rayon", "mmap"] }
 hex = "0.4"
-# Memmap needed for ultra-fast hashing of large files via OS memory mapping
 memmap2 = "0.9"
 
 # Metadata - JSON & Time
