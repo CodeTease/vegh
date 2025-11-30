@@ -6,4 +6,4 @@ For production version, visit these official binding:
 * [VeghJS](https://github.com/CodeTease/veghjs)
 * VeghGo (Soon)
 
-Vegh stable version is v0.2.0, if you want to create binding, lock logic to 0.2.0 (Format version 1).
+Vegh stable version is v0.3.0, if you want to create binding, lock logic to 0.3.0 (Format version 1).

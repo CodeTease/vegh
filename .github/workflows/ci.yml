@@ -10,30 +10,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # 1. Code Style & Quality Check
   lint:
     name: Lint & Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      # Setup Rust toolchain
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      
-      # Cache dependencies to speed up runs
       - uses: Swatinem/rust-cache@v2
-      
       - name: Check Formatting
-        # Fails if code is not formatted according to rustfmt standards
         run: cargo fmt --all -- --check
-        
       - name: Run Clippy
-        # Fails on warnings to ensure code quality
         run: cargo clippy -- -D warnings
 
-  # 2. Cross-Platform Build & E2E Testing
   test:
     name: Test on ${{ matrix.os }}
     needs: lint
@@ -41,14 +31,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Test against all major platforms supported by CodeTease
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
     - uses: actions/checkout@v4
-    
     - uses: dtolnay/rust-toolchain@stable
-    
     - uses: Swatinem/rust-cache@v2
       with:
         key: ${{ matrix.os }}
@@ -56,14 +43,19 @@ jobs:
     - name: Build Release Binary
       run: cargo build --release --verbose
 
-    # Run Unit Tests (Placeholder for future unit tests)
     - name: Run Unit Tests
       run: cargo test --verbose
 
-    # Execute the End-to-End Simulation Script
-    # Note: On Windows, this runs in Git Bash, which supports bash scripts.
-    - name: Run E2E Simulation
+    # Test 1: E2E Happy Path (Backup & Restore integrity)
+    - name: Test Suite - E2E Simulation
       shell: bash
       run: |
         chmod +x ./tests/e2e_simulation.sh
         ./tests/e2e_simulation.sh
+
+    # Test 2: Filtering Logic (Ignore/Include/Exclude)
+    - name: Test Suite - Filtering Logic
+      shell: bash
+      run: |
+        chmod +x ./tests/test_filtering.sh
+        ./tests/test_filtering.sh
