@@ -6,27 +6,71 @@ on:
   pull_request:
     branches: [ "main", "master" ]
 
+# Need write permissions to push formatting fixes
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint:
-    name: Lint & Format
+  lint-and-fix:
+    name: Lint & Auto-Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can push back
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
       - uses: Swatinem/rust-cache@v2
-      - name: Check Formatting
-        run: cargo fmt --all -- --check
-      - name: Run Clippy
-        run: cargo clippy -- -D warnings
+
+      # 1. Run Format (Without --check so it fixes files in-place)
+      - name: Auto Format Code
+        run: cargo fmt --all
+
+      # 2. Run Clippy and auto-fix simple issues
+      - name: Auto Fix Clippy Issues
+        # --fix allows clippy to automatically fix code.
+        # --allow-dirty --allow-staged to run in CI git environment
+        run: cargo clippy --fix --allow-dirty --allow-staged -- -D warnings || true
+        # "|| true" so if there are unfixable errors, it doesn't crash the job immediately.
+        # We will check again in the next step or let the developer fix complex logic errors.
+
+      # 3. Check if any files were modified
+      - name: Check for modified files
+        id: git-check
+        run: echo "modified=$(if git diff-index --quiet HEAD --; then echo "false"; else echo "true"; fi)" >> $GITHUB_OUTPUT
+
+      # 4. If changes exist, commit and push them immediately
+      - name: Commit and Push Fixes
+        if: steps.git-check.outputs.modified == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git commit -am "style: auto-fix linting and formatting issues 🎨"
+          git push
+          echo "::warning::Code styles were automatically fixed. Please pull the latest changes!"
+          # Fail this job to let the developer know changes were made and they need to pull,
+          # but the message is friendlier.
+          exit 1
+
+      # 5. If nothing changed (or after fixing), run final check to ensure everything is OK
+      - name: Verify Code Quality (Final Check)
+        if: steps.git-check.outputs.modified == 'false'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy -- -D warnings
 
   test:
     name: Test on ${{ matrix.os }}
-    needs: lint
+    # Only run tests if lint step passed (and code is clean)
+    needs: lint-and-fix
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,14 +90,12 @@ jobs:
     - name: Run Unit Tests
       run: cargo test --verbose
 
-    # Test 1: E2E Happy Path (Backup & Restore integrity)
     - name: Test Suite - E2E Simulation
       shell: bash
       run: |
         chmod +x ./tests/e2e_simulation.sh
         ./tests/e2e_simulation.sh
 
-    # Test 2: Filtering Logic (Ignore/Include/Exclude)
     - name: Test Suite - Filtering Logic
       shell: bash
       run: |

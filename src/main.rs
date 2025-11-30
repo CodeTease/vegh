@@ -577,6 +577,7 @@ async fn send_file(
         file_size as f64 / 1024.0 / 1024.0
     );
 
+    // [FIX] clippy::redundant_pattern_matching - Use is_some()
     if auth_token.is_some() {
         println!("{} Authentication: Enabled", "🔒".green());
     }
