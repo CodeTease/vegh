@@ -246,6 +246,7 @@ fn get_cache_path(source: &Path) -> PathBuf {
 fn load_cache(source: &Path) -> VeghCache {
     let cache_path = get_cache_path(source);
     if cache_path.exists() {
+        // [FIX] clippy::collapsible_if - Combined check logic
         if let Ok(file) = File::open(&cache_path) {
             if let Ok(cache) = serde_json::from_reader(file) {
                 return cache;
@@ -404,11 +405,11 @@ fn create_snap(
         if let Ok(entry) = result {
             let path = entry.path();
             if path.is_file() {
-                if let Ok(abs) = fs::canonicalize(path) {
-                    if abs == output_abs {
-                        continue;
-                    }
+                // [FIX] clippy::collapsible_if - Using map_or to avoid nesting
+                if fs::canonicalize(path).map_or(false, |abs| abs == output_abs) {
+                    continue;
                 }
+
                 let name = path.strip_prefix(source).unwrap_or(path);
                 let name_str = name.to_string_lossy().to_string();
 
@@ -576,7 +577,8 @@ async fn send_file(
         file_size as f64 / 1024.0 / 1024.0
     );
 
-    if let Some(_) = &auth_token {
+    // [FIX] clippy::redundant_pattern_matching - Use is_some()
+    if auth_token.is_some() {
         println!("{} Authentication: Enabled", "🔒".green());
     }
 
@@ -656,7 +658,8 @@ async fn send_chunked(
 ) -> Result<()> {
     const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
     let chunk_size_u64 = CHUNK_SIZE as u64;
-    let total_chunks = (file_size + chunk_size_u64 - 1) / chunk_size_u64;
+    // [FIX] clippy::manual_div_ceil - Use built-in div_ceil
+    let total_chunks = file_size.div_ceil(chunk_size_u64);
 
     let pb = ProgressBar::new(total_chunks);
     pb.set_style(
