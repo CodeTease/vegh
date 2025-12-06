@@ -43,7 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 📸 Create a snapshot (.snap)
+    /// 📸 Create a snapshot (.vegh)
     Snap {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
                 .file_name()
                 .unwrap_or(std::ffi::OsStr::new("backup"))
                 .to_string_lossy();
-            let output_path = output.unwrap_or(PathBuf::from(format!("{}.snap", folder_name)));
+            let output_path = output.unwrap_or(PathBuf::from(format!("{}.vegh", folder_name)));
 
             println!(
                 "{} Packing '{}' -> '{}'",
