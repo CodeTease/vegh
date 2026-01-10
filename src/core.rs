@@ -133,10 +133,11 @@ pub fn create_snap(
     for pattern in exclude {
         let _ = override_builder.add(&pattern);
     }
-    // [NEW] Ignore the cache directory itself
-    // Note: ignore::OverrideBuilder::add() with a plain string IGNORES it.
-    // Starting with '!' would whitelist it. We want to IGNORE it.
-    let _ = override_builder.add(CACHE_DIR);
+
+    let mut builder = WalkBuilder::new(source);
+    builder.filter_entry(|entry| {
+        !entry.path().to_string_lossy().contains(CACHE_DIR)
+    });
 
     let overrides = override_builder
         .build()
