@@ -28,3 +28,6 @@ b = "build"
 # rustflags = ["-C", "link-arg=-fuse-ld=zld"]
 # [target.aarch64-apple-darwin]
 # rustflags = ["-C", "link-arg=-fuse-ld=zld"]
+
+[build]
+rustc-wrapper = "sccache"
