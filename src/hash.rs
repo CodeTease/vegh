@@ -23,6 +23,65 @@ pub fn compute_file_hash(path: &Path) -> Result<String> {
     }
 }
 
+pub struct ChunkInfo {
+    pub hash: String,
+    pub offset: usize,
+    pub length: usize,
+}
+
+// Compute chunks using FastCDC and their hashes
+pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<(String, Vec<ChunkInfo>)> {
+    let file = File::open(path)?;
+    let mut chunks = Vec::new();
+    let mut file_hasher = Hasher::new();
+
+    // Use mmap for CDC
+    if let Ok(mmap) = unsafe { MmapOptions::new().map(&file) } {
+        // Calculate chunks
+        let cut = fastcdc::v2020::FastCDC::new(
+            &mmap, 
+            (avg_size / 2) as u32, 
+            avg_size as u32, 
+            (avg_size * 2) as u32
+        );
+        
+        for chunk in cut {
+             let chunk_data = &mmap[chunk.offset..chunk.offset + chunk.length];
+             let mut chunk_hasher = Hasher::new();
+             chunk_hasher.update(chunk_data);
+             let chunk_hash = chunk_hasher.finalize().to_hex().to_string();
+             
+             chunks.push(ChunkInfo {
+                 hash: chunk_hash,
+                 offset: chunk.offset,
+                 length: chunk.length,
+             });
+             
+             // Also update file hash
+             file_hasher.update(chunk_data);
+        }
+        
+        Ok((file_hasher.finalize().to_hex().to_string(), chunks))
+    } else {
+        // Fallback for non-mmap (e.g. pipe, special files) - treating as single chunk
+        // CDC on stream is possible but complex to implement here without duplicating logic.
+        // For simplicity, treat as one chunk.
+        let mut f = File::open(path)?;
+        let mut hasher = Hasher::new();
+        copy(&mut f, &mut hasher)?;
+        let hash = hasher.finalize().to_hex().to_string();
+        
+        // Return whole file as one chunk
+        let len = file.metadata()?.len() as usize;
+        chunks.push(ChunkInfo {
+            hash: hash.clone(),
+            offset: 0,
+            length: len,
+        });
+        Ok((hash, chunks))
+    }
+}
+
 pub fn check_integrity(input: &Path) -> Result<(String, Option<VeghMetadata>)> {
     let hash = compute_file_hash(input)?;
 

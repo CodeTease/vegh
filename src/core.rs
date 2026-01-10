@@ -8,8 +8,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Read, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom}; // Re-added Read for tar processing/chunks
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -20,13 +20,17 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::storage::{FileCacheEntry, VeghCache, ManifestEntry, SnapshotManifest, load_cache, save_cache, CACHE_DIR};
-use crate::hash::compute_file_hash;
+use crate::hash::{compute_file_hash, compute_chunks};
 
 // Files that should ALWAYS be included regardless of ignore rules
 const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
 
 // [FV3] Updated Version
 const SNAPSHOT_FORMAT_VERSION: &str = "3";
+// CDC Threshold: 1MB
+const CDC_THRESHOLD: u64 = 1024 * 1024;
+// CDC Avg Size: 1MB (min ~256KB, max ~4MB)
+const CDC_AVG_SIZE: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VeghMetadata {
@@ -153,7 +157,18 @@ pub fn create_snap(
     for result in builder.build() {
         if !running.load(Ordering::SeqCst) {
             pb.finish_with_message("Interrupted!");
-            // Handle partial save/cleanup (omitted for brevity in this rewrite but should be here)
+            
+            // Merge partial results into original cache
+            cache.files.extend(new_cache_files);
+            
+            // Save cache
+            if !no_cache {
+                 println!("{} Interrupted. Saving progress to cache...", "💾".blue());
+                 if let Err(e) = save_cache(source, &cache) {
+                     eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
+                 }
+            }
+
             return Err(anyhow::anyhow!("Process interrupted by user"));
         }
 
@@ -184,48 +199,197 @@ pub fn create_snap(
 
                 total_raw_size += size;
 
-                // True Incremental Logic
-                let (hash, is_cached) = if let Some(cached_entry) = cache.files.get(&name_str) {
-                     if cached_entry.modified == modified && cached_entry.size == size && cached_entry.hash.is_some() {
-                        (cached_entry.hash.clone().unwrap(), true)
+                // --- Deduplication Logic ---
+                // We use CDC if file size > threshold.
+                let use_cdc = size > CDC_THRESHOLD;
+                
+                let (hash, chunks_info, is_cached) = if let Some(cached_entry) = cache.files.get(&name_str) {
+                     let is_hit = cached_entry.modified == modified 
+                               && cached_entry.size == size 
+                               && cached_entry.hash.is_some()
+                               && (!use_cdc || cached_entry.chunks.is_some());
+                     
+                     if is_hit {
+                         let cached_hash = cached_entry.hash.clone().unwrap();
+                         // If cached and we use chunks, we assume cached chunks are valid.
+                         // But we need to reconstruct chunks info (hash/offset/len) to write blobs if needed.
+                         // Problem: Cache stores only hashes, not offsets.
+                         // Solution: Rerun CDC to get offsets, but use cached hashes to avoid re-hashing content?
+                         // Actually CDC is fast. Re-running CDC + Hashing is slow.
+                         // If we hit cache, we know the file content is same.
+                         // We can just re-run CDC + Hash (it will produce same result) OR trust cache.
+                         // But we need to write chunks to tar if they are missing.
+                         // To write chunks, we need to read file.
+                         // So we assume here "Cache Hit" means "We know the hashes, but we might still need to read file to write blobs".
+                         // Optimization: Check if all chunk hashes are already in `written_blobs`.
+                         // If ALL chunks are written, we SKIP reading file! (Big Win for deduplication across files)
+                         // If ANY chunk is missing, we must read file and extract that chunk.
+                         
+                         let cached_chunks = if use_cdc { cached_entry.chunks.clone().unwrap() } else { vec![cached_hash.clone()] };
+                         
+                         let all_written = cached_chunks.iter().all(|h| written_blobs.contains(h));
+                         
+                         if all_written {
+                             // Zero-read optimization!
+                             (cached_hash, None, true)
+                         } else {
+                             // We need to read file to extract missing chunks.
+                             // Re-compute everything (safest)
+                             // Or implement logic to just extract missing chunks?
+                             // Re-computing is simpler and safe.
+                             // But we claimed "Dedup (Cached)".
+                             // Let's re-compute but we expect it to match.
+                             // Actually, if we re-compute, we are doing the work.
+                             // If we want to skip hashing, we need to trust cache.
+                             // But we still need to run CDC to get offsets.
+                             // FastCDC is fast. Hashing is slow.
+                             // So: Run CDC. For each chunk, calculate hash? No, use cached list index?
+                             // No, offsets might change if file changed (but we checked mtime/size).
+                             // If mtime/size match, content is same.
+                             // So: Run CDC. We get chunks C1, C2...
+                             // We assume C1 corresponds to cached_chunks[0].
+                             // We don't hash C1. We just use cached_chunks[0] as hash.
+                             // Then we check `written_blobs`. If missing, write C1 data.
+                             
+                             // However, `compute_chunks` currently does hashing.
+                             // Let's just re-run `compute_chunks` for now to be safe and simple.
+                             // The "Cache Hit" logic in Vegh was mainly to avoid re-hashing for change detection.
+                             // If we re-run, we lose that benefit if we hash again.
+                             // But wait! If `all_written` is false, it means we haven't seen this content in this session.
+                             // So we MUST write it. Hashing is unavoidable if we want to verify integrity or if we don't implement complex "Trust Cache but Read" logic.
+                             // But wait, if it's in Cache (from previous run), we know the hash.
+                             // We can write it without hashing, just using the hash from cache as filename.
+                             // But we need to know WHERE the chunk is in the file.
+                             // So we MUST run CDC (fast) to get offsets.
+                             // So:
+                             // 1. Run CDC (get offsets).
+                             // 2. Don't hash content. Use cached_chunks[i] as hash.
+                             // 3. Write blob if needed.
+                             
+                             // To implement this, we need a `compute_chunks_offsets_only` or similar?
+                             // Or just use `compute_chunks` which does hashing.
+                             // Given implementation time, let's just re-compute if we need to write blobs.
+                             // It's safer.
+                             // The "Zero-read optimization" above handles the case where chunks are already in tar (e.g. duplicate files).
+                             if use_cdc {
+                                let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
+                                (h, Some(chunks), true) // It was cached metadata-wise
+                             } else {
+                                let h = compute_file_hash(path)?;
+                                (h, None, true)
+                             }
+                         }
                      } else {
-                         // Recompute
-                         (compute_file_hash(path)?, false)
+                         // Cache Miss
+                         if use_cdc {
+                             let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
+                             (h, Some(chunks), false)
+                         } else {
+                             let h = compute_file_hash(path)?;
+                             (h, None, false)
+                         }
                      }
                 } else {
-                     (compute_file_hash(path)?, false)
+                     // New file
+                     if use_cdc {
+                         let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
+                         (h, Some(chunks), false)
+                     } else {
+                         let h = compute_file_hash(path)?;
+                         (h, None, false)
+                     }
                 };
 
-                if is_cached {
+                if is_cached && chunks_info.is_none() { 
+                    // This happens if "Zero-read optimization" triggered
                     cached_count += 1;
-                    pb.set_message(format!("Dedup (Cached): {}", name.display()));
+                    pb.set_message(format!("Dedup (Skipped): {}", name.display()));
+                    
+                    // We need to retrieve chunks from cache to put in manifest
+                    let cached_entry = cache.files.get(&name_str).unwrap();
+                    let chunk_hashes = if use_cdc { 
+                        cached_entry.chunks.clone().unwrap() 
+                    } else { 
+                        vec![cached_entry.hash.clone().unwrap()] 
+                    };
+
+                    manifest.entries.push(ManifestEntry {
+                        path: name_str.clone(),
+                        hash: hash.clone(),
+                        size,
+                        modified,
+                        mode,
+                        chunks: Some(chunk_hashes.clone()),
+                    });
+                    
+                    // We also need to update new_cache
+                    new_cache_files.insert(name_str.clone(), cached_entry.clone());
+
                 } else {
-                    pb.set_message(format!("Hashing: {}", name.display()));
-                }
+                    if is_cached {
+                         pb.set_message(format!("Dedup (Rescan): {}", name.display()));
+                    } else {
+                         pb.set_message(format!("Hashing: {}", name.display()));
+                    }
 
-                // Update Cache
-                new_cache_files.insert(name_str.clone(), FileCacheEntry { 
-                    size, 
-                    modified, 
-                    hash: Some(hash.clone()) 
-                });
+                    let mut chunk_hashes_list = Vec::new();
+                    
+                    if let Some(chunks) = chunks_info {
+                        // CDC Mode
+                         let mut f = File::open(path)?;
+                         
+                         for chunk in chunks {
+                             chunk_hashes_list.push(chunk.hash.clone());
+                             
+                             if !written_blobs.contains(&chunk.hash) {
+                                 let blob_path = format!("blobs/{}", chunk.hash);
+                                 
+                                 // We need to read exact chunk.
+                                 // Seek to offset
+                                 f.seek(SeekFrom::Start(chunk.offset as u64))?;
+                                 // Read length
+                                 let mut chunk_data = vec![0u8; chunk.length];
+                                 f.read_exact(&mut chunk_data)?;
+                                 
+                                 // Write to tar
+                                 let mut header = tar::Header::new_gnu();
+                                 header.set_path(&blob_path)?;
+                                 header.set_size(chunk.length as u64);
+                                 header.set_mode(0o644);
+                                 header.set_cksum();
+                                 tar.append_data(&mut header, &blob_path, &chunk_data[..])?;
+                                 
+                                 written_blobs.insert(chunk.hash);
+                             }
+                         }
+                    } else {
+                        // Whole File Mode
+                        chunk_hashes_list.push(hash.clone());
+                        if !written_blobs.contains(&hash) {
+                            let blob_path = format!("blobs/{}", hash);
+                            let mut f = File::open(path)?;
+                            tar.append_file(&blob_path, &mut f)?;
+                            written_blobs.insert(hash.clone());
+                        }
+                    }
 
-                // Update Manifest
-                manifest.entries.push(ManifestEntry {
-                    path: name_str.clone(),
-                    hash: hash.clone(),
-                    size,
-                    modified,
-                    mode,
-                });
+                    // Update Cache
+                    new_cache_files.insert(name_str.clone(), FileCacheEntry { 
+                        size, 
+                        modified, 
+                        hash: Some(hash.clone()),
+                        chunks: Some(chunk_hashes_list.clone())
+                    });
 
-                // Write Blob if not already in this archive
-                if !written_blobs.contains(&hash) {
-                    let blob_path = format!("blobs/{}", hash);
-                    // Open file to stream it into tar
-                    let mut f = File::open(path)?;
-                    tar.append_file(&blob_path, &mut f)?;
-                    written_blobs.insert(hash);
+                    // Update Manifest
+                    manifest.entries.push(ManifestEntry {
+                        path: name_str.clone(),
+                        hash: hash.clone(),
+                        size,
+                        modified,
+                        mode,
+                        chunks: Some(chunk_hashes_list),
+                    });
                 }
                 
                 count += 1;
@@ -276,26 +440,11 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
     let decoder = zstd::stream::read::Decoder::new(file)?;
     let mut archive = tar::Archive::new(decoder);
 
-    // Extract everything to a temporary location or in-memory?
-    // Tar archives are sequential. We might see blobs before manifest or vice-versa.
-    // However, we wrote blobs then manifest.
-    // If we want random access, we need to read the whole thing or unpack everything then rearrange.
-    // BUT, since we are restoring everything, we can just:
-    // 1. Unpack all blobs to a temporary `blobs/` dir in `out_dir`.
-    // 2. Read `manifest.json`.
-    // 3. Move/Copy blobs to their final destinations.
-    // 4. Clean up `blobs/` and `manifest.json`.
-    
-    // Simplest approach: Unpack everything.
     archive.unpack(out_dir)?;
     
     let manifest_path = out_dir.join("manifest.json");
     if !manifest_path.exists() {
-        // Fallback for Legacy FV2 (No manifest, just files)
-        // If no manifest.json, assume it was a standard tarball restore (which unpack() handled).
-        // But FV2 had just files. If we unpacked, they are already in place.
-        // FV3 has `blobs/` and `manifest.json`.
-        // So if `blobs/` exists and `manifest.json` exists, we need to reconstruct.
+        // Legacy FV2 support
         return Ok(());
     }
 
@@ -313,20 +462,29 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         
-        let blob_path = blobs_dir.join(&entry.hash);
-        if blob_path.exists() {
-            fs::copy(&blob_path, &dest_path)?;
-            
-            // Restore permissions
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = fs::Permissions::from_mode(entry.mode);
-                fs::set_permissions(&dest_path, permissions)?;
+        // Truncate/Create file
+        let mut dest_file = File::create(&dest_path)?;
+
+        let chunk_hashes = entry.chunks.unwrap_or_else(|| vec![entry.hash.clone()]);
+        
+        for chunk_hash in chunk_hashes {
+            let blob_path = blobs_dir.join(&chunk_hash);
+            if blob_path.exists() {
+                let mut blob_file = File::open(&blob_path)?;
+                std::io::copy(&mut blob_file, &mut dest_file)?;
+            } else {
+                 pb.println(format!("{} Missing blob {} for {}", "⚠️".yellow(), chunk_hash, entry.path));
             }
-        } else {
-             pb.println(format!("{} Missing blob {} for {}", "⚠️".yellow(), entry.hash, entry.path));
         }
+
+        // Restore permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = fs::Permissions::from_mode(entry.mode);
+            fs::set_permissions(&dest_path, permissions)?;
+        }
+        
         pb.inc(1);
     }
     
@@ -349,14 +507,6 @@ pub fn list_snap(input: &Path) -> Result<()> {
     println!("{} Contents of {}:", "📂".cyan(), input.display());
     println!("{:-<50}", "-");
     
-    // We need to look for manifest.json
-    // Since tar is stream, we can't easily jump around.
-    // We iterate. If we find manifest.json, we parse and print.
-    // If we find other files (Legacy), we print them.
-    
-    // Optimization: If FV3, we only care about manifest.json.
-    // But it might be at the end.
-    
     let mut manifest_found = false;
     
     for entry in archive.entries()? {
@@ -367,13 +517,17 @@ pub fn list_snap(input: &Path) -> Result<()> {
         if path_str == "manifest.json" {
              let manifest: SnapshotManifest = serde_json::from_reader(entry)?;
              for item in manifest.entries {
-                 println!("{:<40} {:>8} bytes [{}]", item.path, item.size, item.hash.chars().take(8).collect::<String>());
+                 let chunks_count = item.chunks.as_ref().map(|c| c.len()).unwrap_or(1);
+                 println!("{:<40} {:>8} bytes [Chunks: {}] [{}]", 
+                    item.path, 
+                    item.size, 
+                    chunks_count,
+                    item.hash.chars().take(8).collect::<String>()
+                );
              }
              manifest_found = true;
-             break; // We found the manifest, we can stop or we might miss other things? 
-                    // In FV3, manifest is authoritative.
+             break; 
         } else if !path_str.starts_with("blobs/") && path_str != ".vegh.json" {
-            // Legacy file or other file
             println!("{:<40} {:>8} bytes", path.display(), entry.size());
         }
     }
@@ -385,7 +539,7 @@ pub fn list_snap(input: &Path) -> Result<()> {
     Ok(())
 }
 
-// Chunked Upload Logic
+// Chunked Upload Logic (Unchanged)
 pub async fn send_file(
     path: &Path,
     url: &str,
@@ -408,7 +562,6 @@ pub async fn send_file(
         file_size as f64 / 1024.0 / 1024.0
     );
 
-    // [FIX] clippy::redundant_pattern_matching - Use is_some()
     if auth_token.is_some() {
         println!("{} Authentication: Enabled", "🔒".green());
     }
@@ -424,7 +577,6 @@ pub async fn send_file(
     }
 }
 
-// [UPDATE] True Streaming Upload (Low RAM usage)
 pub async fn send_streaming(
     path: &Path,
     url: &str,
@@ -433,10 +585,7 @@ pub async fn send_streaming(
 ) -> Result<()> {
     let client = Client::new();
     let file = AsyncFile::open(path).await?;
-
-    // Create a stream from the file (chunked read)
     let stream = FramedRead::new(file, BytesCodec::new());
-    // Convert to reqwest Body
     let body = reqwest::Body::wrap_stream(stream);
 
     let pb = ProgressBar::new(file_size);
@@ -447,13 +596,11 @@ pub async fn send_streaming(
             .progress_chars("#>-"),
     );
 
-    // Note: Reqwest async stream doesn't easily support progress callback *during* send
-    // without wrapping the stream manually. For simplicity/stability, we just show spinner or start.
     pb.set_message("Streaming...");
 
     let mut request = client
         .post(url)
-        .header("Content-Length", file_size) // Good for R2/S3
+        .header("Content-Length", file_size) 
         .header("User-Agent", "CodeTease-Vegh/0.3.0");
 
     if let Some(token) = auth_token {
@@ -489,7 +636,6 @@ pub async fn send_chunked(
 ) -> Result<()> {
     const CHUNK_SIZE: usize = 10 * 1024 * 1024; // 10MB
     let chunk_size_u64 = CHUNK_SIZE as u64;
-    // [FIX] clippy::manual_div_ceil - Use built-in div_ceil
     let total_chunks = file_size.div_ceil(chunk_size_u64);
 
     let pb = ProgressBar::new(total_chunks);
@@ -556,7 +702,7 @@ pub async fn send_chunked(
                 }
             }
         })
-        .buffer_unordered(4); // Process 4 chunks concurrently
+        .buffer_unordered(4); 
 
     let results: Vec<Result<()>> = stream.collect().await;
     for res in results {

@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 // Cache Configuration
 pub const CACHE_DIR: &str = ".veghcache";
-const CACHE_FILE: &str = "index.json";
+const CACHE_FILE: &str = "index.bin.zst";
+const LEGACY_CACHE_FILE: &str = "index.json";
 
 // Cache Entry Structure
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct FileCacheEntry {
     pub size: u64,
     pub modified: u64,
     pub hash: Option<String>,
+    #[serde(default)]
+    pub chunks: Option<Vec<String>>,
 }
 
 // Main Cache Registry
@@ -33,6 +36,8 @@ pub struct ManifestEntry {
     pub modified: u64,
     #[serde(default)]
     pub mode: u32, // Permissions
+    #[serde(default)]
+    pub chunks: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -64,16 +69,33 @@ pub fn load_cache(source: &Path) -> VeghCache {
     }
 
     let cache_path = get_cache_path(source);
+    let legacy_cache_path = source.join(CACHE_DIR).join(LEGACY_CACHE_FILE);
+
+    // 1. Try loading new binary cache
     if cache_path.exists() {
         if let Ok(file) = File::open(&cache_path) {
+            if let Ok(decoder) = zstd::stream::read::Decoder::new(file) {
+                 if let Ok(cache) = bincode::deserialize_from(decoder) {
+                     return cache;
+                 }
+            }
+        }
+        println!("{} Binary cache corrupted or incompatible. Checking legacy...", "⚠️".yellow());
+    }
+    
+    // 2. Fallback to Legacy JSON
+    if legacy_cache_path.exists() {
+        if let Ok(file) = File::open(&legacy_cache_path) {
             if let Ok(cache) = serde_json::from_reader(file) {
+                println!("{} Loaded legacy cache. It will be upgraded on next save.", "ℹ️".blue());
                 return cache;
             }
         }
-        println!("{} Cache corrupted. Cleaning...", "🧹".yellow());
+        println!("{} Legacy cache corrupted. Cleaning...", "🧹".yellow());
         // Clean up corrupt cache to prevent future errors
         let _ = fs::remove_dir_all(&cache_dir_path);
     }
+    
     VeghCache::default()
 }
 
@@ -83,7 +105,26 @@ pub fn save_cache(source: &Path, cache: &VeghCache) -> Result<()> {
     if !cache_dir.exists() {
         fs::create_dir(&cache_dir)?;
     }
-    let file = File::create(get_cache_path(source))?;
-    serde_json::to_writer_pretty(file, cache)?;
+    
+    let final_path = get_cache_path(source);
+    let temp_path = cache_dir.join(format!("{}.tmp", CACHE_FILE));
+    
+    // Atomic Write: Write to temp file first
+    {
+        let file = File::create(&temp_path)?;
+        let mut encoder = zstd::stream::write::Encoder::new(file, 0)?; // Level 0 is default
+        bincode::serialize_into(&mut encoder, cache)?;
+        encoder.finish()?;
+    }
+    
+    // Rename to final path (Atomic Replace)
+    fs::rename(temp_path, final_path)?;
+    
+    // Cleanup Legacy if it exists
+    let legacy_path = source.join(CACHE_DIR).join(LEGACY_CACHE_FILE);
+    if legacy_path.exists() {
+        let _ = fs::remove_file(legacy_path);
+    }
+    
     Ok(())
 }
