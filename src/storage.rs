@@ -1,23 +1,24 @@
 use anyhow::{Context, Result};
-use colored::*;
 use redb::{Database, TableDefinition, WriteTransaction, ReadableTable, ReadableDatabase};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use colored::Colorize;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::Cursor;
 
 // Cache Configuration
 pub const CACHE_DIR: &str = ".veghcache";
 const CACHE_DB_FILE: &str = "cache.redb";
 const JSON_CACHE_FILE: &str = "index.json";
 
-// Redb Tables - v2 Schema
-const TABLE_DATA_V2_A: TableDefinition<&str, &[u8]> = TableDefinition::new("data_v2_A");
-const TABLE_DATA_V2_B: TableDefinition<&str, &[u8]> = TableDefinition::new("data_v2_B");
-const TABLE_INODES_V2_A: TableDefinition<u64, &str> = TableDefinition::new("inodes_v2_A");
-const TABLE_INODES_V2_B: TableDefinition<u64, &str> = TableDefinition::new("inodes_v2_B");
+// Redb Tables - v3 Schema (Bumped for compression/parallel changes)
+const TABLE_DATA_V3_A: TableDefinition<&str, &[u8]> = TableDefinition::new("data_v3_A");
+const TABLE_DATA_V3_B: TableDefinition<&str, &[u8]> = TableDefinition::new("data_v3_B");
+const TABLE_INODES_V3_A: TableDefinition<u64, &str> = TableDefinition::new("inodes_v3_A");
+const TABLE_INODES_V3_B: TableDefinition<u64, &str> = TableDefinition::new("inodes_v3_B");
 const TABLE_META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
 // Cache Entry Structure
@@ -26,7 +27,6 @@ pub struct FileCacheEntry {
     pub size: u64,
     pub modified: u64,
     
-    // Improved Change Detection
     #[serde(default)]
     pub ctime_sec: i64,
     #[serde(default)]
@@ -36,19 +36,50 @@ pub struct FileCacheEntry {
     #[serde(default)]
     pub inode: u64,
     
-    // GC Retention
     #[serde(default)]
     pub last_seen: u64,
 
-    // Binary Hashes
     pub hash: Option<[u8; 32]>,
+    
+    // [FV3] Compressed Chunks
     #[serde(default)]
-    pub chunks: Option<Vec<[u8; 32]>>,
+    pub chunks_compressed: Option<Vec<u8>>,
+    
     #[serde(default)]
     pub sparse_hash: Option<[u8; 32]>,
 }
 
-// FV3 Manifest Structures (Unchanged - Needs Hex Strings for JSON)
+impl FileCacheEntry {
+    pub fn set_chunks(&mut self, chunks: Vec<[u8; 32]>) -> Result<()> {
+        // Flatten [u8; 32] to Vec<u8>
+        let flat: Vec<u8> = chunks.iter().flat_map(|c| c.iter()).copied().collect();
+        // Compress
+        let compressed = zstd::stream::encode_all(Cursor::new(flat), 3)?; // Level 3 is fast
+        self.chunks_compressed = Some(compressed);
+        Ok(())
+    }
+
+    pub fn get_chunks(&self) -> Result<Option<Vec<[u8; 32]>>> {
+        if let Some(compressed) = &self.chunks_compressed {
+            let decompressed = zstd::stream::decode_all(Cursor::new(compressed))?;
+            // Reconstruct [u8; 32] chunks
+            if decompressed.len() % 32 != 0 {
+                return Ok(None); // Corrupt?
+            }
+            let count = decompressed.len() / 32;
+            let mut chunks = Vec::with_capacity(count);
+            for i in 0..count {
+                let slice = &decompressed[i*32..(i+1)*32];
+                chunks.push(slice.try_into()?);
+            }
+            Ok(Some(chunks))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+// FV3 Manifest Structures
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ManifestEntry {
     pub path: String,
@@ -56,7 +87,7 @@ pub struct ManifestEntry {
     pub size: u64,
     pub modified: u64,
     #[serde(default)]
-    pub mode: u32, // Permissions
+    pub mode: u32,
     #[serde(default)]
     pub chunks: Option<Vec<String>>,
 }
@@ -66,12 +97,6 @@ pub struct SnapshotManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-// Legacy Cache for Migration (Kept only for JSON migration)
-// Note: This matches the OLD FileCacheEntry structure for deserialization purposes only.
-// If we encounter a JSON file, we will try to migrate it, but since we are changing binary formats
-// drastically, we might just skip complex migration for now or map it best effort.
-// The user prompt asked for upgrades, so we prioritize the new struct. 
-// A "cold cache" start is acceptable for major version bumps in dev tools.
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct LegacyVeghCache {
     pub last_snapshot: i64,
@@ -88,9 +113,52 @@ struct LegacyFileCacheEntry {
     pub sparse_hash: Option<String>,
 }
 
+// Reader Handle
+#[derive(Clone)]
+pub struct CacheReader {
+    db: Arc<Database>,
+    active_slot: String,
+}
+
+impl CacheReader {
+    pub fn get(&self, path: &str) -> Result<Option<FileCacheEntry>> {
+        let txn = self.db.begin_read()?;
+        let bytes_opt: Option<Vec<u8>> = if self.active_slot == "A" {
+            if let Ok(table) = txn.open_table(TABLE_DATA_V3_A) {
+                table.get(path)?.map(|v| v.value().to_vec())
+            } else { None }
+        } else {
+             if let Ok(table) = txn.open_table(TABLE_DATA_V3_B) {
+                table.get(path)?.map(|v| v.value().to_vec())
+            } else { None }
+        };
+
+        if let Some(bytes) = bytes_opt {
+            let entry: FileCacheEntry = bincode::deserialize(&bytes)?;
+            return Ok(Some(entry));
+        }
+        Ok(None)
+    }
+
+    pub fn get_path_by_inode(&self, inode: u64) -> Result<Option<String>> {
+        if inode == 0 { return Ok(None); }
+        let txn = self.db.begin_read()?;
+        let path_opt = if self.active_slot == "A" {
+            if let Ok(table) = txn.open_table(TABLE_INODES_V3_A) {
+                table.get(inode)?.map(|v| v.value().to_string())
+            } else { None }
+        } else {
+            if let Ok(table) = txn.open_table(TABLE_INODES_V3_B) {
+                table.get(inode)?.map(|v| v.value().to_string())
+            } else { None }
+        };
+        Ok(path_opt)
+    }
+}
+
 pub struct CacheDB {
     db: Arc<Database>,
-    active_slot: String, // "A" or "B"
+    active_slot: String,
     txn: Option<WriteTransaction>,
 }
 
@@ -110,7 +178,6 @@ impl CacheDB {
         let db = Database::create(&db_path)?;
         let db = Arc::new(db);
 
-        // Determine active slot
         let active_slot = {
             let read_txn = db.begin_read()?;
             if let Ok(table) = read_txn.open_table(TABLE_META) {
@@ -128,36 +195,39 @@ impl CacheDB {
             txn: Some(db.begin_write()?),
         };
 
-        // Migration Logic (JSON only - binary table names changed so old data is ignored)
+        // Check legacy JSON and migrate if needed (Best effort)
         let json_path = cache_dir.join(JSON_CACHE_FILE);
         if json_path.exists() {
-            cache_db.migrate_legacy_json(&json_path)?;
+             cache_db.migrate_legacy_json(&json_path)?;
         }
 
-        // Prepare the "Next" tables (clear them)
         cache_db.prepare_next_tables()?;
 
         Ok(cache_db)
     }
+    
+    pub fn reader(&self) -> CacheReader {
+        CacheReader {
+            db: self.db.clone(),
+            active_slot: self.active_slot.clone(),
+        }
+    }
 
     fn prepare_next_tables(&mut self) -> Result<()> {
         let next_slot = if self.active_slot == "A" { "B" } else { "A" };
-        let txn = self.txn.as_mut().unwrap(); // Safe as we init with Some
+        let txn = self.txn.as_mut().unwrap();
 
         if next_slot == "A" {
-            // Delete tables to clear them
-            let _ = txn.delete_table(TABLE_DATA_V2_A);
-            let _ = txn.delete_table(TABLE_INODES_V2_A);
-            // Re-create empty tables
-            txn.open_table(TABLE_DATA_V2_A)?;
-            txn.open_table(TABLE_INODES_V2_A)?;
+            let _ = txn.delete_table(TABLE_DATA_V3_A);
+            let _ = txn.delete_table(TABLE_INODES_V3_A);
+            txn.open_table(TABLE_DATA_V3_A)?;
+            txn.open_table(TABLE_INODES_V3_A)?;
         } else {
-            let _ = txn.delete_table(TABLE_DATA_V2_B);
-            let _ = txn.delete_table(TABLE_INODES_V2_B);
-            txn.open_table(TABLE_DATA_V2_B)?;
-            txn.open_table(TABLE_INODES_V2_B)?;
+            let _ = txn.delete_table(TABLE_DATA_V3_B);
+            let _ = txn.delete_table(TABLE_INODES_V3_B);
+            txn.open_table(TABLE_DATA_V3_B)?;
+            txn.open_table(TABLE_INODES_V3_B)?;
         }
-
         Ok(())
     }
 
@@ -165,25 +235,26 @@ impl CacheDB {
         println!("{} Migrating JSON cache to Embedded DB...", "📦".cyan());
         if let Ok(file) = File::open(path) {
             if let Ok(cache) = serde_json::from_reader::<_, LegacyVeghCache>(file) {
-                 // Best effort conversion
-                 let mut converted_files = HashMap::new();
                  let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                 let txn = self.txn.as_mut().unwrap();
+                 
+                 // We write to ACTIVE so that the Reader can see it for this run.
+                 // But wait, `open` prepares NEXT.
+                 // If we migrate, we should probably write to ACTIVE table?
+                 // But `CacheDB` logic is: Read Active, Write Next.
+                 // If we migrate, we populate the "Active" tables so the current run can use them.
+                 
+                 let (mut data, mut inodes) = if self.active_slot == "A" {
+                     (txn.open_table(TABLE_DATA_V3_A)?, txn.open_table(TABLE_INODES_V3_A)?)
+                 } else {
+                     (txn.open_table(TABLE_DATA_V3_B)?, txn.open_table(TABLE_INODES_V3_B)?)
+                 };
                  
                  for (k, v) in cache.files {
-                     // Try to decode hex strings to bytes
-                     let hash_bytes = v.hash.and_then(|h| hex::decode(h).ok())
-                        .and_then(|v| v.try_into().ok());
+                     let hash_bytes = v.hash.and_then(|h| hex::decode(h).ok()).and_then(|v| v.try_into().ok());
+                     let sparse_bytes = v.sparse_hash.and_then(|h| hex::decode(h).ok()).and_then(|v| v.try_into().ok());
                      
-                     let sparse_bytes = v.sparse_hash.and_then(|h| hex::decode(h).ok())
-                        .and_then(|v| v.try_into().ok());
-                        
-                     let chunks_bytes = v.chunks.map(|chunks| {
-                         chunks.into_iter()
-                             .filter_map(|h| hex::decode(h).ok().and_then(|v| v.try_into().ok()))
-                             .collect()
-                     });
-
-                     let new_entry = FileCacheEntry {
+                     let mut new_entry = FileCacheEntry {
                          size: v.size,
                          modified: v.modified,
                          inode: v.inode,
@@ -192,77 +263,27 @@ impl CacheDB {
                          device_id: 0,
                          last_seen: now,
                          hash: hash_bytes,
-                         chunks: chunks_bytes,
+                         chunks_compressed: None,
                          sparse_hash: sparse_bytes,
                      };
-                     converted_files.insert(k, new_entry);
+                     
+                     if let Some(chunks) = v.chunks {
+                         let bin_chunks: Vec<[u8; 32]> = chunks.into_iter()
+                             .filter_map(|h| hex::decode(h).ok().and_then(|v| v.try_into().ok()))
+                             .collect();
+                         let _ = new_entry.set_chunks(bin_chunks);
+                     }
+                     
+                     let bytes = bincode::serialize(&new_entry)?;
+                     data.insert(k.as_str(), bytes.as_slice())?;
+                     if new_entry.inode > 0 {
+                         inodes.insert(new_entry.inode, k.as_str())?;
+                     }
                  }
-                 self.import_map(converted_files)?;
             }
         }
         let _ = fs::remove_file(path);
         Ok(())
-    }
-
-    fn import_map(&mut self, files: HashMap<String, FileCacheEntry>) -> Result<()> {
-        let txn = self.txn.as_mut().unwrap();
-        
-        // Write to whichever slot is active or next?
-        // Actually, this is only called during OPEN, and we want to populate the ACTIVE slot
-        // so `get` calls work.
-        if self.active_slot == "A" {
-            let mut data = txn.open_table(TABLE_DATA_V2_A)?;
-            let mut inodes = txn.open_table(TABLE_INODES_V2_A)?;
-            for (path, entry) in files {
-                let bytes = bincode::serialize(&entry)?;
-                data.insert(path.as_str(), bytes.as_slice())?;
-                if entry.inode > 0 {
-                    inodes.insert(entry.inode, path.as_str())?;
-                }
-            }
-        } else {
-            let mut data = txn.open_table(TABLE_DATA_V2_B)?;
-            let mut inodes = txn.open_table(TABLE_INODES_V2_B)?;
-            for (path, entry) in files {
-                let bytes = bincode::serialize(&entry)?;
-                data.insert(path.as_str(), bytes.as_slice())?;
-                if entry.inode > 0 {
-                    inodes.insert(entry.inode, path.as_str())?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // Get entry from ACTIVE table
-    pub fn get(&self, path: &str) -> Result<Option<FileCacheEntry>> {
-        if let Some(txn) = &self.txn {
-            let bytes_opt = if self.active_slot == "A" {
-                txn.open_table(TABLE_DATA_V2_A)?.get(path)?.map(|v| v.value().to_vec())
-            } else {
-                txn.open_table(TABLE_DATA_V2_B)?.get(path)?.map(|v| v.value().to_vec())
-            };
-
-            if let Some(bytes) = bytes_opt {
-                let entry: FileCacheEntry = bincode::deserialize(&bytes)?;
-                return Ok(Some(entry));
-            }
-        }
-        Ok(None)
-    }
-
-    // Get path by inode from ACTIVE table
-    pub fn get_path_by_inode(&self, inode: u64) -> Result<Option<String>> {
-        if inode == 0 { return Ok(None); }
-        if let Some(txn) = &self.txn {
-            let path_opt = if self.active_slot == "A" {
-                txn.open_table(TABLE_INODES_V2_A)?.get(inode)?.map(|v| v.value().to_string())
-            } else {
-                txn.open_table(TABLE_INODES_V2_B)?.get(inode)?.map(|v| v.value().to_string())
-            };
-            return Ok(path_opt);
-        }
-        Ok(None)
     }
 
     // Insert into NEXT table
@@ -273,79 +294,78 @@ impl CacheDB {
         let bytes = bincode::serialize(entry)?;
 
         if next_slot == "A" {
-            let mut data = txn.open_table(TABLE_DATA_V2_A)?;
+            let mut data = txn.open_table(TABLE_DATA_V3_A)?;
             data.insert(path, bytes.as_slice())?;
             if entry.inode > 0 {
-                let mut inodes = txn.open_table(TABLE_INODES_V2_A)?;
+                let mut inodes = txn.open_table(TABLE_INODES_V3_A)?;
                 inodes.insert(entry.inode, path)?;
             }
         } else {
-            let mut data = txn.open_table(TABLE_DATA_V2_B)?;
+            let mut data = txn.open_table(TABLE_DATA_V3_B)?;
             data.insert(path, bytes.as_slice())?;
             if entry.inode > 0 {
-                let mut inodes = txn.open_table(TABLE_INODES_V2_B)?;
+                let mut inodes = txn.open_table(TABLE_INODES_V3_B)?;
                 inodes.insert(entry.inode, path)?;
             }
         }
         Ok(())
     }
+    
+    // Batch Commit Logic
+    pub fn commit_batch(&mut self) -> Result<()> {
+        if let Some(txn) = self.txn.take() {
+            // We do NOT swap active_slot here. We just commit the data written so far to the NEXT table.
+            // The active slot remains the same (Old data), so readers still read old data.
+            // The next table gets checkpoints.
+            txn.commit()?;
+            // Start a new write transaction
+            self.txn = Some(self.db.begin_write()?);
+        }
+        Ok(())
+    }
 
-    // Garbage Collect and Merge
-    // Iterates Active table, checks entries not in Next table.
-    // If they are recent enough (retention policy), copy them to Next.
     pub fn garbage_collect_and_merge(&mut self, retention_seconds: u64) -> Result<()> {
-        // We cannot borrow `self.txn` mutably twice (for iterating and inserting).
-        // Redb `iter()` holds a borrow on the table which holds a borrow on the txn.
-        // We need to collect keys/values to copy first, or use unsafe, or just collect keys.
-        // Collecting keys might be safer and simpler given memory constraints are usually fine for keys.
-        // Or we can just read all entries into a Vec if not too massive.
-        // Better: iterate, collect keys of items to keep. Then loop keys, read from active, write to next.
-        // Actually, we can open the active table for reading via a separate read transaction?
-        // No, we are inside a WriteTransaction. A WriteTransaction can open tables.
-        
         let next_slot = if self.active_slot == "A" { "B" } else { "A" };
         let current_slot = &self.active_slot;
         
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let mut entries_to_keep: Vec<(String, Vec<u8>)> = Vec::new();
         
-        // Scope for iteration
         {
             let txn = self.txn.as_mut().unwrap();
-            let source = if current_slot == "A" { txn.open_table(TABLE_DATA_V2_A)? } else { txn.open_table(TABLE_DATA_V2_B)? };
-            let dest = if next_slot == "A" { txn.open_table(TABLE_DATA_V2_A)? } else { txn.open_table(TABLE_DATA_V2_B)? };
+            // Source is ACTIVE
+            let source = if current_slot == "A" { 
+                match txn.open_table(TABLE_DATA_V3_A) { Ok(t) => Some(t), Err(_) => None }
+            } else { 
+                match txn.open_table(TABLE_DATA_V3_B) { Ok(t) => Some(t), Err(_) => None }
+            };
+            
+            // Dest is NEXT
+            let dest = if next_slot == "A" { txn.open_table(TABLE_DATA_V3_A)? } else { txn.open_table(TABLE_DATA_V3_B)? };
 
-            // We iterate source. If key not in dest, we check last_seen.
-            for res in source.iter()? {
-                let (k, v) = res?;
-                let key_str = k.value();
-                
-                // If not already in Next (dest)
-                if dest.get(key_str)?.is_none() {
-                    let val_bytes = v.value().to_vec();
-                    // Deserialize to check last_seen
-                    if let Ok(entry) = bincode::deserialize::<FileCacheEntry>(&val_bytes) {
-                        if now.saturating_sub(entry.last_seen) < retention_seconds {
-                            entries_to_keep.push((key_str.to_string(), val_bytes));
+            if let Some(source_table) = source {
+                for res in source_table.iter()? {
+                    let (k, v) = res?;
+                    let key_str = k.value();
+                    
+                    if dest.get(key_str)?.is_none() {
+                        let val_bytes = v.value().to_vec();
+                        if let Ok(entry) = bincode::deserialize::<FileCacheEntry>(&val_bytes) {
+                            if now.saturating_sub(entry.last_seen) < retention_seconds {
+                                entries_to_keep.push((key_str.to_string(), val_bytes));
+                            }
                         }
                     }
                 }
             }
-        } // End scope, releasing table borrows
+        } 
 
-        // Write kept entries
         let txn = self.txn.as_mut().unwrap();
-        let mut dest_data = if next_slot == "A" { txn.open_table(TABLE_DATA_V2_A)? } else { txn.open_table(TABLE_DATA_V2_B)? };
-        let mut dest_inodes = if next_slot == "A" { txn.open_table(TABLE_INODES_V2_A)? } else { txn.open_table(TABLE_INODES_V2_B)? };
+        let mut dest_data = if next_slot == "A" { txn.open_table(TABLE_DATA_V3_A)? } else { txn.open_table(TABLE_DATA_V3_B)? };
+        let mut dest_inodes = if next_slot == "A" { txn.open_table(TABLE_INODES_V3_A)? } else { txn.open_table(TABLE_INODES_V3_B)? };
         
-        let kept_count = entries_to_keep.len();
-        if kept_count > 0 {
-            println!("{} GC: Keeping {} valid entries.", "🧹".blue(), kept_count);
-        }
-
         for (path, bytes) in entries_to_keep {
             dest_data.insert(path.as_str(), bytes.as_slice())?;
-            // Also need to restore inode mapping if it exists
              if let Ok(entry) = bincode::deserialize::<FileCacheEntry>(&bytes) {
                  if entry.inode > 0 {
                      dest_inodes.insert(entry.inode, path.as_str())?;
@@ -356,8 +376,6 @@ impl CacheDB {
         Ok(())
     }
 
-
-    // Commit changes: Swap Active <-> Next and persist
     pub fn commit(mut self) -> Result<()> {
         let next_slot = if self.active_slot == "A" { "B" } else { "A" };
         
@@ -371,16 +389,9 @@ impl CacheDB {
         Ok(())
     }
 
-    // Sync Partial (Ctrl+C): Copy unvisited from Active to Next, then Commit
-    // Updated to use the new GC/Merge logic essentially (infinite retention or just copy all valid).
-    // Actually, sync_partial implies we were interrupted, so we want to keep everything that was in active
-    // but not yet in next, effectively "merging" the old state back so we don't lose it.
     pub fn sync_partial(mut self) -> Result<()> {
         println!("{} Syncing partial cache...", "💾".blue());
-        
-        // Use a very long retention to keep everything
         self.garbage_collect_and_merge(u64::MAX)?;
-        
         self.commit()?;
         println!("{} Cache saved (Partial).", "✅".green());
         Ok(())

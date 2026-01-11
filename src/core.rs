@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use colored::*;
+use crossbeam_channel::{bounded};
 use futures::stream::{self, StreamExt};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom}; 
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -33,6 +33,8 @@ const CDC_THRESHOLD: u64 = 1024 * 1024;
 const CDC_AVG_SIZE: usize = 1024 * 1024;
 // Cache Retention: 30 Days
 const CACHE_RETENTION_SEC: u64 = 30 * 24 * 60 * 60;
+// Batch Commit Size (Files)
+const BATCH_COMMIT_SIZE: usize = 1000;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VeghMetadata {
@@ -50,7 +52,6 @@ fn default_format_version() -> String {
     "1".to_string()
 }
 
-// Utility to format bytes into human-readable strings
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
@@ -60,6 +61,39 @@ pub fn format_bytes(bytes: u64) -> String {
         i += 1;
     }
     format!("{:.2} {}", v, UNITS[i])
+}
+
+// Pipeline Messages
+enum WorkerResult {
+    Processed(ProcessedMessage),
+    Error(String),
+}
+
+struct ProcessedMessage {
+    path_str: String,
+    abs_path: PathBuf,
+    metadata_info: MetadataInfo,
+    entry: FileCacheEntry,
+    data_action: DataAction,
+    is_cached_hit: bool,
+}
+
+struct MetadataInfo {
+    size: u64,
+    modified: u64,
+    mode: u32,
+}
+
+enum DataAction {
+    Cached, // All data in cache/blobs already
+    WriteFile(Vec<u8>), // Hash bytes
+    WriteChunks(Vec<ChunkData>), // List of chunks to write
+}
+
+struct ChunkData {
+    hash: [u8; 32],
+    offset: u64,
+    length: usize,
 }
 
 pub fn create_snap(
@@ -100,10 +134,11 @@ pub fn create_snap(
     let meta_json = serde_json::to_string_pretty(&meta)?;
 
     let mut encoder = zstd::stream::write::Encoder::new(file, level)?;
-    let workers = std::thread::available_parallelism()
+    // We use workers for hashing, so let zstd use multithreading too
+    let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    encoder.multithread(workers as u32)?;
+    encoder.multithread(num_threads as u32)?;
 
     let mut tar = tar::Builder::new(encoder);
 
@@ -122,329 +157,363 @@ pub fn create_snap(
             .unwrap(),
     );
 
-    let mut count = 0;
-    let mut cached_count = 0;
-    let mut total_raw_size = 0;
-    
-    // FV3: Track manifest and blobs
-    let mut manifest = SnapshotManifest::default();
-    let mut written_blobs: HashSet<String> = HashSet::new(); // Hex strings for easy lookup of written status
+    // 1. Setup Channels
+    let (path_tx, path_rx) = bounded::<PathBuf>(1024);
+    let (res_tx, res_rx) = bounded::<WorkerResult>(1024);
 
-    let mut override_builder = OverrideBuilder::new(source);
-    for pattern in include {
-        let _ = override_builder.add(&format!("!{}", pattern));
-    }
-    for pattern in exclude {
-        let _ = override_builder.add(&pattern);
-    }
-
-    let mut builder = WalkBuilder::new(source);
-    builder.filter_entry(|entry| {
-        !entry.path().to_string_lossy().contains(CACHE_DIR)
-    });
-
-    let overrides = override_builder
-        .build()
-        .context("Failed to build override rules")?;
-
-    let mut builder = WalkBuilder::new(source);
-    for &f in PRESERVED_FILES {
-        builder.add_custom_ignore_filename(f);
-    }
-
-    builder.hidden(true).git_ignore(true).overrides(overrides);
-
-    for result in builder.build() {
-        if !running.load(Ordering::SeqCst) {
-            pb.finish_with_message("Interrupted!");
-            
-            // Sync partial results
-            if !no_cache {
-                 if let Err(e) = cache_db.sync_partial() {
-                     eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
-                 }
-            }
-
-            return Err(anyhow::anyhow!("Process interrupted by user"));
+    // 2. Scanner Thread
+    let source_buf = source.to_path_buf();
+    let source_buf_for_scan = source_buf.clone();
+    let path_tx_for_scan = path_tx.clone();
+    let r_scan = running.clone();
+    let scanner_handle = std::thread::spawn(move || {
+        let mut override_builder = OverrideBuilder::new(&source_buf_for_scan);
+        for pattern in include {
+            let _ = override_builder.add(&format!("!{}", pattern));
+        }
+        for pattern in exclude {
+            let _ = override_builder.add(&pattern);
         }
 
-        if let Ok(entry) = result {
-            let path = entry.path();
-            if path.is_file() {
-                if fs::canonicalize(path).is_ok_and(|abs| abs == output_abs) {
-                    continue;
+        let overrides = match override_builder.build() {
+            Ok(o) => o,
+            Err(_) => return, // Should log?
+        };
+
+        let mut builder = WalkBuilder::new(&source_buf_for_scan);
+        for &f in PRESERVED_FILES {
+            builder.add_custom_ignore_filename(f);
+        }
+        builder.filter_entry(|entry| !entry.path().to_string_lossy().contains(CACHE_DIR));
+        builder.hidden(true).git_ignore(true).overrides(overrides);
+
+        for result in builder.build() {
+            if !r_scan.load(Ordering::SeqCst) { break; }
+            if let Ok(entry) = result {
+                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                     if let Ok(abs) = fs::canonicalize(entry.path()) {
+                         if abs == output_abs { continue; }
+                     }
+                     if path_tx_for_scan.send(entry.path().to_path_buf()).is_err() {
+                         break;
+                     }
                 }
+            }
+        }
+    });
 
-                let name = path.strip_prefix(source).unwrap_or(path);
-                let name_str = name.to_string_lossy().to_string();
+    // 3. Worker Threads
+    let mut worker_handles = Vec::new();
+    let cache_reader = cache_db.reader(); 
+    let written_blobs = Arc::new(dashmap::DashMap::new()); 
+    
+    let written_blobs_shared = written_blobs.clone();
+    let _source_path_str = source.to_string_lossy().to_string();
 
-                let metadata = path.metadata()?;
-                let modified = metadata
-                    .modified()
-                    .unwrap_or(SystemTime::UNIX_EPOCH)
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let size = metadata.len();
+    for _ in 0..num_threads {
+        let rx = path_rx.clone();
+        let tx = res_tx.clone();
+        let reader = cache_reader.clone();
+        let blobs = written_blobs_shared.clone();
+        let src_root = source_buf.clone();
+        let r_worker = running.clone();
+
+        worker_handles.push(std::thread::spawn(move || {
+            while let Ok(path) = rx.recv() {
+                if !r_worker.load(Ordering::SeqCst) { break; }
                 
-                // --- Extended Metadata (Unix) ---
-                #[cfg(unix)]
-                let (mode, inode, device_id, ctime_sec, ctime_nsec) = {
-                    use std::os::unix::fs::MetadataExt;
-                    (
-                        metadata.mode(), 
-                        metadata.ino(), 
-                        metadata.dev(), 
-                        metadata.ctime(), 
-                        metadata.ctime_nsec() as u32
-                    )
-                };
-                #[cfg(not(unix))]
-                let (mode, inode, device_id, ctime_sec, ctime_nsec) = (0o644, 0, 0, 0, 0);
+                // Process File
+                let process_res = (|| -> Result<ProcessedMessage> {
+                    let name = path.strip_prefix(&src_root).unwrap_or(&path);
+                    let name_str = name.to_string_lossy().to_string();
+                    let metadata = path.metadata()?;
+                    let size = metadata.len();
+                    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+                        .duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
 
-
-                total_raw_size += size;
-                
-                let now_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-
-                // --- Deduplication Logic ---
-                let use_cdc = size > CDC_THRESHOLD;
-                
-                // Compute sparse hash eagerly
-                let sparse_hash = compute_sparse_hash(path, size).ok();
-
-                let cached_entry_opt = if no_cache { None } else { cache_db.get(&name_str)? };
-
-                let (hash, chunks_info, is_cached) = if let Some(cached_entry) = cached_entry_opt {
-                     // 1. Standard Path Match - Enhanced Check
-                     let mut is_hit = cached_entry.modified == modified 
-                               && cached_entry.size == size
-                               && cached_entry.inode == inode
-                               // Stricter check if platform supports it (non-zero in cache and current)
-                               && (cached_entry.device_id == 0 || device_id == 0 || cached_entry.device_id == device_id)
-                               && (cached_entry.ctime_sec == 0 || ctime_sec == 0 || cached_entry.ctime_sec == ctime_sec) 
-                               && cached_entry.hash.is_some()
-                               && (!use_cdc || cached_entry.chunks.is_some());
-                     
-                     // Sparse Verification
-                     if is_hit {
-                         if let Some(cached_sparse) = &cached_entry.sparse_hash {
-                             if let Some(current_sparse) = &sparse_hash {
-                                 if cached_sparse != current_sparse {
-                                     is_hit = false;
-                                     pb.set_message(format!("Mismatch (Sparse): {}", name.display()));
-                                 }
-                             }
-                         }
-                     }
-
-                     if is_hit {
-                         let cached_hash = cached_entry.hash.clone().unwrap();
-                         // Convert chunks for checking existence
-                         let cached_chunks = if use_cdc { 
-                             cached_entry.chunks.clone().unwrap() 
-                         } else { 
-                             vec![cached_hash.clone()] 
-                         };
-                         
-                         let all_written = cached_chunks.iter().all(|h| written_blobs.contains(&hex::encode(h)));
-                         
-                         if all_written {
-                             (cached_hash, None, true)
-                         } else {
-                             // Re-read file if blobs missing
-                             if use_cdc {
-                                let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
-                                (h, Some(chunks), true)
-                             } else {
-                                let h = compute_file_hash(path)?;
-                                (h, None, true)
-                             }
-                         }
-                     } else {
-                         // Cache Miss
-                         if use_cdc {
-                             let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
-                             (h, Some(chunks), false)
-                         } else {
-                             let h = compute_file_hash(path)?;
-                             (h, None, false)
-                         }
-                     }
-                } else {
-                     // 2. Rename Detection
-                     let mut renamed_entry: Option<FileCacheEntry> = None;
-                     if !no_cache && inode > 0 {
-                         if let Some(old_path) = cache_db.get_path_by_inode(inode)? {
-                             if let Some(entry) = cache_db.get(&old_path)? {
-                                 if entry.size == size 
-                                    && entry.modified == modified 
-                                    && entry.hash.is_some()
-                                    && entry.device_id == device_id 
-                                    && entry.ctime_sec == ctime_sec
-                                 {
-                                     renamed_entry = Some(entry);
-                                 }
-                             }
-                         }
-                     }
-
-                     if let Some(entry) = renamed_entry {
-                         let cached_hash = entry.hash.clone().unwrap_or_default();
-                         let cached_chunks = if use_cdc { 
-                             entry.chunks.clone().unwrap_or_else(|| vec![cached_hash.clone()]) 
-                         } else { 
-                             vec![cached_hash.clone()] 
-                         };
-                         let all_written = cached_chunks.iter().all(|h| written_blobs.contains(&hex::encode(h)));
-                         
-                         if all_written {
-                             (cached_hash, None, true)
-                         } else {
-                             if use_cdc {
-                                let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
-                                (h, Some(chunks), true)
-                             } else {
-                                let h = compute_file_hash(path)?;
-                                (h, None, true)
-                             }
-                         }
-                     } else {
-                         if use_cdc {
-                             let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
-                             (h, Some(chunks), false)
-                         } else {
-                             let h = compute_file_hash(path)?;
-                             (h, None, false)
-                         }
-                     }
-                };
-
-                // Processing
-                if is_cached && chunks_info.is_none() { 
-                    cached_count += 1;
-                    pb.set_message(format!("Dedup (Skipped): {}", name.display()));
-                    
-                    let entry_to_use_opt = if !no_cache {
-                        if let Some(e) = cache_db.get(&name_str)? {
-                            Some(e)
-                        } else if inode > 0 {
-                            if let Some(old_path) = cache_db.get_path_by_inode(inode)? {
-                                cache_db.get(&old_path)?
-                            } else { None }
-                        } else { None }
-                    } else { None };
-                    
-                    let mut final_entry = entry_to_use_opt.expect("Logic Error: marked cached but not found");
-                    
-                    // Hexify chunks for manifest
-                    let chunk_hashes_bin = if use_cdc {
-                        final_entry.chunks.clone().unwrap_or_else(|| vec![final_entry.hash.clone().unwrap_or_default()])
-                    } else {
-                        vec![final_entry.hash.clone().unwrap_or_default()]
+                    #[cfg(unix)]
+                    let (mode, inode, device_id, ctime_sec, ctime_nsec) = {
+                        use std::os::unix::fs::MetadataExt;
+                        (metadata.mode(), metadata.ino(), metadata.dev(), metadata.ctime(), metadata.ctime_nsec() as u32)
                     };
-                    
-                    let chunk_hashes_hex: Vec<String> = chunk_hashes_bin.iter().map(|h| hex::encode(h)).collect();
+                    #[cfg(windows)]
+                    let (mode, inode, device_id, ctime_sec, ctime_nsec) = {
+                        use std::os::windows::fs::MetadataExt;
+                        let inode = metadata.file_index().unwrap_or(0);
+                        let dev = metadata.volume_serial_number().unwrap_or(0) as u64;
+                        (0o644, inode, dev, 0, 0)
+                    };
+                    #[cfg(not(any(unix, windows)))]
+                    let (mode, inode, device_id, ctime_sec, ctime_nsec) = (0o644, 0, 0, 0, 0);
 
-                    manifest.entries.push(ManifestEntry {
-                        path: name_str.clone(),
-                        hash: hex::encode(hash),
-                        size,
-                        modified,
-                        mode,
-                        chunks: Some(chunk_hashes_hex),
-                    });
-                    
-                    // Update entry metadata
-                    if final_entry.sparse_hash.is_none() {
-                        final_entry.sparse_hash = sparse_hash.clone();
-                    }
-                    final_entry.inode = inode;
-                    final_entry.device_id = device_id;
-                    final_entry.ctime_sec = ctime_sec;
-                    final_entry.ctime_nsec = ctime_nsec;
-                    final_entry.last_seen = now_ts;
-                    
-                    cache_db.insert(&name_str, &final_entry)?;
+                    let now_ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+                    let use_cdc = size > CDC_THRESHOLD;
 
-                } else {
-                    if is_cached {
-                         pb.set_message(format!("Dedup (Rescan): {}", name.display()));
-                    } else {
-                         pb.set_message(format!("Hashing: {}", name.display()));
-                    }
+                    let sparse_hash = compute_sparse_hash(&path, size).ok();
+                    let cached_entry_opt = if no_cache { None } else { reader.get(&name_str)? };
 
-                    let mut chunk_hashes_bin = Vec::new();
-                    
-                    if let Some(chunks) = chunks_info {
-                        // CDC Mode
-                         let mut f = File::open(path)?;
+                    let (hash, chunks_info, is_cached_hit) = if let Some(cached_entry) = cached_entry_opt {
+                         let mut is_hit = cached_entry.modified == modified 
+                                   && cached_entry.size == size
+                                   && cached_entry.inode == inode
+                                   && (cached_entry.device_id == 0 || device_id == 0 || cached_entry.device_id == device_id)
+                                   && (cached_entry.ctime_sec == 0 || ctime_sec == 0 || cached_entry.ctime_sec == ctime_sec) 
+                                   && cached_entry.hash.is_some();
                          
-                         for chunk in chunks {
-                             chunk_hashes_bin.push(chunk.hash.clone());
-                             let chunk_hex = hex::encode(chunk.hash);
+                         if is_hit && use_cdc {
+                             // Check if chunks exist in entry
+                             is_hit = cached_entry.get_chunks().ok().flatten().is_some();
+                         }
+                         
+                         if is_hit {
+                             if let Some(cached_sparse) = &cached_entry.sparse_hash {
+                                 if let Some(current_sparse) = &sparse_hash {
+                                     if cached_sparse != current_sparse { is_hit = false; }
+                                 }
+                             }
+                         }
+
+                         if is_hit {
+                             let cached_hash = cached_entry.hash.clone().unwrap();
+                             let cached_chunks = if use_cdc { 
+                                 cached_entry.get_chunks()?.unwrap() 
+                             } else { 
+                                 vec![cached_hash.clone()] 
+                             };
                              
-                             if !written_blobs.contains(&chunk_hex) {
-                                 let blob_path = format!("blobs/{}", chunk_hex);
-                                 
-                                 f.seek(SeekFrom::Start(chunk.offset as u64))?;
-                                 let mut chunk_data = vec![0u8; chunk.length];
-                                 f.read_exact(&mut chunk_data)?;
-                                 
-                                 let mut header = tar::Header::new_gnu();
-                                 header.set_path(&blob_path)?;
-                                 header.set_size(chunk.length as u64);
-                                 header.set_mode(0o644);
-                                 header.set_cksum();
-                                 tar.append_data(&mut header, &blob_path, &chunk_data[..])?;
-                                 
-                                 written_blobs.insert(chunk_hex);
+                             let all_written = cached_chunks.iter().all(|h| blobs.contains_key(&hex::encode(h)));
+                             
+                             if all_written {
+                                 (cached_hash, None, true)
+                             } else {
+                                 // Re-read needed
+                                 if use_cdc {
+                                    let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                    (h, Some(chunks), true)
+                                 } else {
+                                    let h = compute_file_hash(&path)?;
+                                    (h, None, true)
+                                 }
+                             }
+                         } else {
+                             // Miss
+                             if use_cdc {
+                                 let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                 (h, Some(chunks), false)
+                             } else {
+                                 let h = compute_file_hash(&path)?;
+                                 (h, None, false)
                              }
                          }
                     } else {
-                        // Whole File Mode
+                         // Rename check
+                         let mut renamed_entry: Option<FileCacheEntry> = None;
+                         if !no_cache && inode > 0 {
+                             if let Some(old_path) = reader.get_path_by_inode(inode)? {
+                                 if let Some(entry) = reader.get(&old_path)? {
+                                     if entry.size == size && entry.modified == modified {
+                                         renamed_entry = Some(entry);
+                                     }
+                                 }
+                             }
+                         }
+
+                         if let Some(entry) = renamed_entry {
+                             let cached_hash = entry.hash.clone().unwrap_or_default();
+                             let cached_chunks = if use_cdc { 
+                                 entry.get_chunks()?.unwrap_or_else(|| vec![cached_hash.clone()]) 
+                             } else { 
+                                 vec![cached_hash.clone()] 
+                             };
+                             let all_written = cached_chunks.iter().all(|h| blobs.contains_key(&hex::encode(h)));
+                             
+                             if all_written {
+                                 (cached_hash, None, true)
+                             } else {
+                                 if use_cdc {
+                                    let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                    (h, Some(chunks), true)
+                                 } else {
+                                    let h = compute_file_hash(&path)?;
+                                    (h, None, true)
+                                 }
+                             }
+                         } else {
+                             if use_cdc {
+                                 let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                 (h, Some(chunks), false)
+                             } else {
+                                 let h = compute_file_hash(&path)?;
+                                 (h, None, false)
+                             }
+                         }
+                    };
+
+                    // Construct Result
+                    let mut data_action = DataAction::Cached;
+                    let mut chunk_hashes_bin = Vec::new();
+
+                    if let Some(chunks) = chunks_info {
+                        let mut chunks_to_write = Vec::new();
+                        for c in chunks {
+                             chunk_hashes_bin.push(c.hash.clone());
+                             let hex_h = hex::encode(c.hash);
+                             if !blobs.contains_key(&hex_h) {
+                                 chunks_to_write.push(ChunkData {
+                                     hash: c.hash,
+                                     offset: c.offset as u64,
+                                     length: c.length,
+                                 });
+                             }
+                        }
+                        if !chunks_to_write.is_empty() {
+                            data_action = DataAction::WriteChunks(chunks_to_write);
+                        }
+                    } else {
                         chunk_hashes_bin.push(hash.clone());
-                        let hash_hex = hex::encode(hash);
-                        
-                        if !written_blobs.contains(&hash_hex) {
-                            let blob_path = format!("blobs/{}", hash_hex);
-                            let mut f = File::open(path)?;
-                            tar.append_file(&blob_path, &mut f)?;
-                            written_blobs.insert(hash_hex);
+                        let hex_h = hex::encode(hash);
+                        if !blobs.contains_key(&hex_h) {
+                            data_action = DataAction::WriteFile(hash.to_vec());
                         }
                     }
 
-                    // Insert into Cache DB
-                    cache_db.insert(&name_str, &FileCacheEntry { 
-                        size, 
+                    // Create Entry
+                    let mut entry = FileCacheEntry {
+                        size,
                         modified,
                         inode,
                         device_id,
                         ctime_sec,
                         ctime_nsec,
                         last_seen: now_ts,
-                        hash: Some(hash.clone()),
-                        chunks: Some(chunk_hashes_bin.clone()),
-                        sparse_hash: sparse_hash.clone(),
-                    })?;
+                        hash: Some(hash),
+                        chunks_compressed: None, // Set below
+                        sparse_hash,
+                    };
+                    entry.set_chunks(chunk_hashes_bin)?;
 
-                    // Update Manifest
-                    manifest.entries.push(ManifestEntry {
-                        path: name_str.clone(),
-                        hash: hex::encode(hash),
-                        size,
-                        modified,
-                        mode,
-                        chunks: Some(chunk_hashes_bin.iter().map(|h| hex::encode(h)).collect()),
-                    });
+                    Ok(ProcessedMessage {
+                        path_str: name_str,
+                        abs_path: path,
+                        metadata_info: MetadataInfo { size, modified, mode },
+                        entry,
+                        data_action,
+                        is_cached_hit,
+                    })
+
+                })();
+
+                match process_res {
+                    Ok(msg) => { let _ = tx.send(WorkerResult::Processed(msg)); },
+                    Err(e) => { let _ = tx.send(WorkerResult::Error(e.to_string())); }
                 }
-                
-                count += 1;
             }
-        }
+        }));
     }
 
-    // Write Manifest
+    // 4. Writer Loop (Main Thread)
+    drop(path_tx);
+    drop(res_tx);
+
+    let mut count = 0;
+    let mut cached_count = 0;
+    let mut total_raw_size = 0;
+    let mut manifest = SnapshotManifest::default();
+    let mut batch_counter = 0;
+    
+    while let Ok(msg) = res_rx.recv() {
+         if !running.load(Ordering::SeqCst) { break; }
+
+         match msg {
+             WorkerResult::Error(e) => {
+                 eprintln!("{} Error: {}", "⚠️".yellow(), e);
+             }
+             WorkerResult::Processed(pm) => {
+                 total_raw_size += pm.metadata_info.size;
+                 
+                 // Handle Data Writing
+                 match pm.data_action {
+                     DataAction::Cached => {
+                         // Nothing to write
+                         if pm.is_cached_hit {
+                             pb.set_message(format!("Dedup: {}", pm.path_str));
+                             cached_count += 1;
+                         }
+                     }
+                     DataAction::WriteFile(hash_bytes) => {
+                         let hash_hex = hex::encode(&hash_bytes);
+                         if !written_blobs.contains_key(&hash_hex) {
+                             pb.set_message(format!("Writing: {}", pm.path_str));
+                             let blob_path = format!("blobs/{}", hash_hex);
+                             let mut f = File::open(&pm.abs_path)?;
+                             tar.append_file(&blob_path, &mut f)?;
+                             written_blobs.insert(hash_hex, ());
+                         } else {
+                              pb.set_message(format!("Dedup: {}", pm.path_str));
+                         }
+                     }
+                     DataAction::WriteChunks(chunks) => {
+                         pb.set_message(format!("Chunking: {}", pm.path_str));
+                         let mut f = File::open(&pm.abs_path)?;
+                         for chunk in chunks {
+                             let chunk_hex = hex::encode(chunk.hash);
+                             if !written_blobs.contains_key(&chunk_hex) {
+                                 let blob_path = format!("blobs/{}", chunk_hex);
+                                 f.seek(SeekFrom::Start(chunk.offset))?;
+                                 let mut chunk_buf = vec![0u8; chunk.length];
+                                 f.read_exact(&mut chunk_buf)?;
+                                 
+                                 let mut header = tar::Header::new_gnu();
+                                 header.set_path(&blob_path)?;
+                                 header.set_size(chunk.length as u64);
+                                 header.set_mode(0o644);
+                                 header.set_cksum();
+                                 tar.append_data(&mut header, &blob_path, &chunk_buf[..])?;
+                                 
+                                 written_blobs.insert(chunk_hex, ());
+                             }
+                         }
+                     }
+                 }
+
+                 // Update Cache DB
+                 cache_db.insert(&pm.path_str, &pm.entry)?;
+                 
+                 // Update Manifest
+                 let chunk_hashes_hex: Option<Vec<String>> = pm.entry.get_chunks().ok().flatten()
+                     .map(|v| v.iter().map(|h| hex::encode(h)).collect());
+                 
+                 manifest.entries.push(ManifestEntry {
+                     path: pm.path_str,
+                     hash: hex::encode(pm.entry.hash.unwrap_or_default()),
+                     size: pm.metadata_info.size,
+                     modified: pm.metadata_info.modified,
+                     mode: pm.metadata_info.mode,
+                     chunks: chunk_hashes_hex,
+                 });
+
+                 count += 1;
+                 batch_counter += 1;
+                 
+                 if batch_counter >= BATCH_COMMIT_SIZE {
+                     cache_db.commit_batch()?;
+                     batch_counter = 0;
+                 }
+             }
+         }
+    }
+
+    let _ = scanner_handle.join();
+    for h in worker_handles { let _ = h.join(); }
+    
+    if !running.load(Ordering::SeqCst) {
+        pb.finish_with_message("Interrupted!");
+        if !no_cache {
+            let _ = cache_db.sync_partial();
+        }
+        return Err(anyhow::anyhow!("Interrupted"));
+    }
+
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     let mut header = tar::Header::new_gnu();
     header.set_path("manifest.json")?;
@@ -453,25 +522,19 @@ pub fn create_snap(
     header.set_cksum();
     tar.append_data(&mut header, "manifest.json", manifest_json.as_bytes())?;
 
-    // GC & Commit Cache
     if !no_cache {
         println!("{} Running garbage collection...", "🧹".blue());
         if let Err(e) = cache_db.garbage_collect_and_merge(CACHE_RETENTION_SEC) {
             eprintln!("{} GC Warning: {}", "⚠️".yellow(), e);
         }
-
         if let Err(e) = cache_db.commit() {
-            pb.println(format!(
-                "{} Warning: Failed to save cache: {}",
-                "⚠️".yellow(),
-                e
-            ));
+             eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
         }
     }
 
     pb.finish_with_message(format!(
         "Packed {} files ({} cached, {} blobs) using {} threads.",
-        count, cached_count, written_blobs.len(), workers
+        count, cached_count, written_blobs.len(), num_threads
     ));
 
     let zstd_encoder = tar.into_inner()?;
@@ -481,6 +544,8 @@ pub fn create_snap(
     Ok((total_raw_size, final_size))
 }
 
+// ... Unchanged helpers ...
+// I need to include the rest of the file or it gets truncated!
 pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
     if !out_dir.exists() {
         fs::create_dir_all(out_dir)?;
@@ -494,7 +559,6 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
     
     let manifest_path = out_dir.join("manifest.json");
     if !manifest_path.exists() {
-        // Legacy FV2 support
         return Ok(());
     }
 
@@ -512,9 +576,7 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
         
-        // Truncate/Create file
         let mut dest_file = File::create(&dest_path)?;
-
         let chunk_hashes = entry.chunks.unwrap_or_else(|| vec![entry.hash.clone()]);
         
         for chunk_hash in chunk_hashes {
@@ -527,7 +589,6 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
             }
         }
 
-        // Restore permissions
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -540,10 +601,8 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
     
     pb.finish_with_message("Restoration Complete!");
 
-    // Cleanup
     let _ = fs::remove_file(manifest_path);
     let _ = fs::remove_dir_all(blobs_dir);
-    // Also remove .vegh.json if it was unpacked
     let _ = fs::remove_file(out_dir.join(".vegh.json"));
 
     Ok(())
@@ -589,13 +648,13 @@ pub fn list_snap(input: &Path) -> Result<()> {
     Ok(())
 }
 
-// Chunked Upload Logic (Unchanged)
 pub async fn send_file(
     path: &Path,
     url: &str,
     force_chunk: bool,
     auth_token: Option<String>,
 ) -> Result<()> {
+    
     if !path.exists() {
         anyhow::bail!("File not found: {}", path.display());
     }
@@ -616,7 +675,7 @@ pub async fn send_file(
         println!("{} Authentication: Enabled", "🔒".green());
     }
 
-    const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024; // 100MB
+    const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024; 
 
     if file_size < CHUNK_THRESHOLD && !force_chunk {
         println!("{} Mode: Streaming Direct Upload", "🌊".yellow());
