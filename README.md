@@ -8,4 +8,4 @@ For production version, visit these official binding:
 
 Vegh stable version is v0.3.0, if you want to create binding, lock logic to 0.3.0 (Format version 2).
 
-Remember, Vegh's official extension is `.vegh`, `.snap` is a popular alternate extension.
+(This is the Format Version 2 branch for comparison)
