@@ -2,9 +2,34 @@ use anyhow::Result;
 use blake3::Hasher;
 use memmap2::MmapOptions;
 use std::fs::File;
-use std::io::{Read, copy};
+use std::io::{Read, copy, Seek, SeekFrom};
 use std::path::Path;
 use crate::core::VeghMetadata;
+
+// Trust-but-Verify: Sparse Hashing
+// Reads 4KB head + 4KB tail (or less if small)
+pub fn compute_sparse_hash(path: &Path, size: u64) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Hasher::new();
+    let sample_size = 4096;
+
+    if size <= (sample_size * 2) {
+        // File too small, hash everything
+        copy(&mut file, &mut hasher)?;
+    } else {
+        // Head
+        let mut buffer = vec![0u8; sample_size as usize];
+        file.read_exact(&mut buffer)?;
+        hasher.update(&buffer);
+        
+        // Tail
+        file.seek(SeekFrom::End(-(sample_size as i64)))?;
+        file.read_exact(&mut buffer)?;
+        hasher.update(&buffer);
+    }
+    
+    Ok(hasher.finalize().to_hex().to_string())
+}
 
 // Compute BLAKE3 hash of a file
 pub fn compute_file_hash(path: &Path) -> Result<String> {

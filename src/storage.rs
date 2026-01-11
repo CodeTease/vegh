@@ -15,9 +15,13 @@ const LEGACY_CACHE_FILE: &str = "index.json";
 pub struct FileCacheEntry {
     pub size: u64,
     pub modified: u64,
+    #[serde(default)]
+    pub inode: u64,
     pub hash: Option<String>,
     #[serde(default)]
     pub chunks: Option<Vec<String>>,
+    #[serde(default)]
+    pub sparse_hash: Option<String>,
 }
 
 // Main Cache Registry

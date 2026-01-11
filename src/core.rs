@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::storage::{FileCacheEntry, VeghCache, ManifestEntry, SnapshotManifest, load_cache, save_cache, CACHE_DIR};
-use crate::hash::{compute_file_hash, compute_chunks};
+use crate::hash::{compute_file_hash, compute_chunks, compute_sparse_hash};
 
 // Files that should ALWAYS be included regardless of ignore rules
 const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
@@ -84,6 +84,19 @@ pub fn create_snap(
     } else {
         load_cache(source)
     };
+
+    // [FV3.1] Build Inode Map for Rename Detection
+    // This is a reverse index: Inode -> FileCacheEntry
+    // Only populated if we are on Unix-like systems where inodes are reliable.
+    #[cfg(unix)]
+    let inode_map: HashMap<u64, &FileCacheEntry> = cache.files.values()
+        .map(|entry| (entry.inode, entry))
+        .filter(|(inode, _)| *inode > 0)
+        .collect();
+    
+    // On non-Unix, empty map
+    #[cfg(not(unix))]
+    let inode_map: HashMap<u64, &FileCacheEntry> = HashMap::new();
 
     let mut new_cache_files = HashMap::new();
     let file = File::create(output).context("Output file creation failed")?;
@@ -197,90 +210,59 @@ pub fn create_snap(
                 #[cfg(not(unix))]
                 let mode = 0o644;
 
+                // Inode
+                #[cfg(unix)]
+                let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+                #[cfg(not(unix))]
+                let inode = 0;
+
                 total_raw_size += size;
 
                 // --- Deduplication Logic ---
                 // We use CDC if file size > threshold.
                 let use_cdc = size > CDC_THRESHOLD;
                 
+                // Compute sparse hash eagerly for verification/storage
+                let sparse_hash = compute_sparse_hash(path, size).ok();
+
                 let (hash, chunks_info, is_cached) = if let Some(cached_entry) = cache.files.get(&name_str) {
-                     let is_hit = cached_entry.modified == modified 
-                               && cached_entry.size == size 
+                     // 1. Standard Path Match
+                     let mut is_hit = cached_entry.modified == modified 
+                               && cached_entry.size == size
+                               && cached_entry.inode == inode // Check inode too!
                                && cached_entry.hash.is_some()
                                && (!use_cdc || cached_entry.chunks.is_some());
                      
+                     // [Trust-but-Verify] Sparse Hash Verification
+                     if is_hit {
+                         if let Some(cached_sparse) = &cached_entry.sparse_hash {
+                             if let Some(current_sparse) = &sparse_hash {
+                                 if cached_sparse != current_sparse {
+                                     is_hit = false;
+                                     pb.set_message(format!("Mismatch (Sparse): {}", name.display()));
+                                 }
+                             }
+                         }
+                     }
+
                      if is_hit {
                          let cached_hash = cached_entry.hash.clone().unwrap();
-                         // If cached and we use chunks, we assume cached chunks are valid.
-                         // But we need to reconstruct chunks info (hash/offset/len) to write blobs if needed.
-                         // Problem: Cache stores only hashes, not offsets.
-                         // Solution: Rerun CDC to get offsets, but use cached hashes to avoid re-hashing content?
-                         // Actually CDC is fast. Re-running CDC + Hashing is slow.
-                         // If we hit cache, we know the file content is same.
-                         // We can just re-run CDC + Hash (it will produce same result) OR trust cache.
-                         // But we need to write chunks to tar if they are missing.
-                         // To write chunks, we need to read file.
-                         // So we assume here "Cache Hit" means "We know the hashes, but we might still need to read file to write blobs".
-                         // Optimization: Check if all chunk hashes are already in `written_blobs`.
-                         // If ALL chunks are written, we SKIP reading file! (Big Win for deduplication across files)
-                         // If ANY chunk is missing, we must read file and extract that chunk.
-                         
                          let cached_chunks = if use_cdc { cached_entry.chunks.clone().unwrap() } else { vec![cached_hash.clone()] };
-                         
                          let all_written = cached_chunks.iter().all(|h| written_blobs.contains(h));
                          
                          if all_written {
-                             // Zero-read optimization!
                              (cached_hash, None, true)
                          } else {
-                             // We need to read file to extract missing chunks.
-                             // Re-compute everything (safest)
-                             // Or implement logic to just extract missing chunks?
-                             // Re-computing is simpler and safe.
-                             // But we claimed "Dedup (Cached)".
-                             // Let's re-compute but we expect it to match.
-                             // Actually, if we re-compute, we are doing the work.
-                             // If we want to skip hashing, we need to trust cache.
-                             // But we still need to run CDC to get offsets.
-                             // FastCDC is fast. Hashing is slow.
-                             // So: Run CDC. For each chunk, calculate hash? No, use cached list index?
-                             // No, offsets might change if file changed (but we checked mtime/size).
-                             // If mtime/size match, content is same.
-                             // So: Run CDC. We get chunks C1, C2...
-                             // We assume C1 corresponds to cached_chunks[0].
-                             // We don't hash C1. We just use cached_chunks[0] as hash.
-                             // Then we check `written_blobs`. If missing, write C1 data.
-                             
-                             // However, `compute_chunks` currently does hashing.
-                             // Let's just re-run `compute_chunks` for now to be safe and simple.
-                             // The "Cache Hit" logic in Vegh was mainly to avoid re-hashing for change detection.
-                             // If we re-run, we lose that benefit if we hash again.
-                             // But wait! If `all_written` is false, it means we haven't seen this content in this session.
-                             // So we MUST write it. Hashing is unavoidable if we want to verify integrity or if we don't implement complex "Trust Cache but Read" logic.
-                             // But wait, if it's in Cache (from previous run), we know the hash.
-                             // We can write it without hashing, just using the hash from cache as filename.
-                             // But we need to know WHERE the chunk is in the file.
-                             // So we MUST run CDC (fast) to get offsets.
-                             // So:
-                             // 1. Run CDC (get offsets).
-                             // 2. Don't hash content. Use cached_chunks[i] as hash.
-                             // 3. Write blob if needed.
-                             
-                             // To implement this, we need a `compute_chunks_offsets_only` or similar?
-                             // Or just use `compute_chunks` which does hashing.
-                             // Given implementation time, let's just re-compute if we need to write blobs.
-                             // It's safer.
-                             // The "Zero-read optimization" above handles the case where chunks are already in tar (e.g. duplicate files).
                              if use_cdc {
                                 let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
-                                (h, Some(chunks), true) // It was cached metadata-wise
+                                (h, Some(chunks), true)
                              } else {
                                 let h = compute_file_hash(path)?;
                                 (h, None, true)
                              }
                          }
                      } else {
-                         // Cache Miss
+                         // Cache Miss (Modified file at same path)
                          if use_cdc {
                              let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
                              (h, Some(chunks), false)
@@ -290,13 +272,49 @@ pub fn create_snap(
                          }
                      }
                 } else {
-                     // New file
-                     if use_cdc {
-                         let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
-                         (h, Some(chunks), false)
+                     // 2. Rename Detection (New File path)
+                     // Check if inode exists in cache map
+                     let mut renamed_entry: Option<&FileCacheEntry> = None;
+                     if inode > 0 {
+                         if let Some(entry) = inode_map.get(&inode) {
+                             if entry.size == size && entry.modified == modified && entry.hash.is_some() {
+                                 renamed_entry = Some(entry);
+                             }
+                         }
+                     }
+
+                     if let Some(entry) = renamed_entry {
+                         // RENAME DETECTED!
+                         let cached_hash = entry.hash.clone().unwrap_or_default();
+                         let cached_chunks = if use_cdc { 
+                             entry.chunks.clone().unwrap_or_else(|| vec![cached_hash.clone()]) 
+                         } else { 
+                             vec![cached_hash.clone()] 
+                         };
+                         let all_written = cached_chunks.iter().all(|h| written_blobs.contains(h));
+                         
+                         // We treat this exactly like a Cache Hit, but we update the path later.
+                         if all_written {
+                             (cached_hash, None, true)
+                         } else {
+                             // We need to read chunks
+                             if use_cdc {
+                                let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
+                                (h, Some(chunks), true)
+                             } else {
+                                let h = compute_file_hash(path)?;
+                                (h, None, true)
+                             }
+                         }
                      } else {
-                         let h = compute_file_hash(path)?;
-                         (h, None, false)
+                         // New file (Truly new)
+                         if use_cdc {
+                             let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
+                             (h, Some(chunks), false)
+                         } else {
+                             let h = compute_file_hash(path)?;
+                             (h, None, false)
+                         }
                      }
                 };
 
@@ -306,11 +324,39 @@ pub fn create_snap(
                     pb.set_message(format!("Dedup (Skipped): {}", name.display()));
                     
                     // We need to retrieve chunks from cache to put in manifest
-                    let cached_entry = cache.files.get(&name_str).unwrap();
+                    // If it was renamed, it won't be in cache.files.get(&name_str)
+                    // We need to use 'renamed_entry' if available, or 'cached_entry'
+                    
+                    // But 'renamed_entry' variable is not available here easily due to scope.
+                    // Actually, 'is_cached' being true implies we found it SOMEWHERE (either path match or rename match).
+                    // If path match: cache.files.get(&name_str) is Some.
+                    // If rename match: cache.files.get(&name_str) is None.
+                    
+                    let entry_to_use = if let Some(e) = cache.files.get(&name_str) {
+                        e.clone()
+                    } else if inode > 0 {
+                         // Must be rename match
+                         // Re-lookup in inode_map
+                         // (Optimization: we could have returned the entry from the if block, but returning references is tricky with lifetimes)
+                         // We know it exists because is_cached is true and it wasn't path match (assuming logic holds)
+                         // Wait, if is_cached is true, it means EITHER path match OR rename match.
+                         // If path match, get(&name_str) works.
+                         // If rename match, get(&name_str) fails.
+                         // So if fails, we check inode map.
+                         if let Some(e) = inode_map.get(&inode) {
+                             (*e).clone()
+                         } else {
+                             // This should not happen if logic is correct
+                             panic!("Logic Error: marked cached but not found");
+                         }
+                    } else {
+                        panic!("Logic Error: marked cached but no inode/path match");
+                    };
+
                     let chunk_hashes = if use_cdc { 
-                        cached_entry.chunks.clone().unwrap() 
+                        entry_to_use.chunks.clone().unwrap_or_else(|| vec![entry_to_use.hash.clone().unwrap_or_default()])
                     } else { 
-                        vec![cached_entry.hash.clone().unwrap()] 
+                        vec![entry_to_use.hash.clone().unwrap_or_default()] 
                     };
 
                     manifest.entries.push(ManifestEntry {
@@ -323,7 +369,19 @@ pub fn create_snap(
                     });
                     
                     // We also need to update new_cache
-                    new_cache_files.insert(name_str.clone(), cached_entry.clone());
+                    // Note: We insert the OLD entry data (hash/chunks) but with NEW path logic (size/mod/inode/hash from reused entry)
+                    // The entry_to_use has OLD path info? No, FileCacheEntry doesn't store path.
+                    // It stores size, mod, inode, hash, chunks.
+                    // We want to use CURRENT size/mod (which match old one) and OLD hash/chunks.
+                    // Also update inode to current inode (which matches old one).
+                    // So cloning entry_to_use is correct.
+                    let mut final_entry = entry_to_use;
+                    // Ensure sparse hash is up to date (though if it matched, it should be same)
+                    // But if it was missing in old entry, we should add it now.
+                    if final_entry.sparse_hash.is_none() {
+                        final_entry.sparse_hash = sparse_hash.clone();
+                    }
+                    new_cache_files.insert(name_str.clone(), final_entry);
 
                 } else {
                     if is_cached {
@@ -376,9 +434,14 @@ pub fn create_snap(
                     // Update Cache
                     new_cache_files.insert(name_str.clone(), FileCacheEntry { 
                         size, 
-                        modified, 
+                        modified,
+                        #[cfg(unix)]
+                        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+                        #[cfg(not(unix))]
+                        inode: 0,
                         hash: Some(hash.clone()),
-                        chunks: Some(chunk_hashes_list.clone())
+                        chunks: Some(chunk_hashes_list.clone()),
+                        sparse_hash: sparse_hash.clone(), // Store sparse hash
                     });
 
                     // Update Manifest
