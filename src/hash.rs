@@ -8,7 +8,7 @@ use crate::core::VeghMetadata;
 
 // Trust-but-Verify: Sparse Hashing
 // Reads 4KB head + 4KB tail (or less if small)
-pub fn compute_sparse_hash(path: &Path, size: u64) -> Result<String> {
+pub fn compute_sparse_hash(path: &Path, size: u64) -> Result<[u8; 32]> {
     let mut file = File::open(path)?;
     let mut hasher = Hasher::new();
     let sample_size = 4096;
@@ -28,34 +28,34 @@ pub fn compute_sparse_hash(path: &Path, size: u64) -> Result<String> {
         hasher.update(&buffer);
     }
     
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok(*hasher.finalize().as_bytes())
 }
 
 // Compute BLAKE3 hash of a file
-pub fn compute_file_hash(path: &Path) -> Result<String> {
+pub fn compute_file_hash(path: &Path) -> Result<[u8; 32]> {
     let file = File::open(path)?;
     // Try mmap first
     if let Ok(mmap) = unsafe { MmapOptions::new().map(&file) } {
         let mut hasher = Hasher::new();
         hasher.update_rayon(&mmap);
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(*hasher.finalize().as_bytes())
     } else {
         // Fallback
         let mut f = File::open(path)?;
         let mut hasher = Hasher::new();
         copy(&mut f, &mut hasher)?;
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(*hasher.finalize().as_bytes())
     }
 }
 
 pub struct ChunkInfo {
-    pub hash: String,
+    pub hash: [u8; 32],
     pub offset: usize,
     pub length: usize,
 }
 
 // Compute chunks using FastCDC and their hashes
-pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<(String, Vec<ChunkInfo>)> {
+pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<([u8; 32], Vec<ChunkInfo>)> {
     let file = File::open(path)?;
     let mut chunks = Vec::new();
     let mut file_hasher = Hasher::new();
@@ -74,7 +74,7 @@ pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<(String, Vec<Chunk
              let chunk_data = &mmap[chunk.offset..chunk.offset + chunk.length];
              let mut chunk_hasher = Hasher::new();
              chunk_hasher.update(chunk_data);
-             let chunk_hash = chunk_hasher.finalize().to_hex().to_string();
+             let chunk_hash = *chunk_hasher.finalize().as_bytes();
              
              chunks.push(ChunkInfo {
                  hash: chunk_hash,
@@ -86,7 +86,7 @@ pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<(String, Vec<Chunk
              file_hasher.update(chunk_data);
         }
         
-        Ok((file_hasher.finalize().to_hex().to_string(), chunks))
+        Ok((*file_hasher.finalize().as_bytes(), chunks))
     } else {
         // Fallback for non-mmap (e.g. pipe, special files) - treating as single chunk
         // CDC on stream is possible but complex to implement here without duplicating logic.
@@ -94,12 +94,12 @@ pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<(String, Vec<Chunk
         let mut f = File::open(path)?;
         let mut hasher = Hasher::new();
         copy(&mut f, &mut hasher)?;
-        let hash = hasher.finalize().to_hex().to_string();
+        let hash = *hasher.finalize().as_bytes();
         
         // Return whole file as one chunk
         let len = file.metadata()?.len() as usize;
         chunks.push(ChunkInfo {
-            hash: hash.clone(),
+            hash,
             offset: 0,
             length: len,
         });
@@ -108,7 +108,8 @@ pub fn compute_chunks(path: &Path, avg_size: usize) -> Result<(String, Vec<Chunk
 }
 
 pub fn check_integrity(input: &Path) -> Result<(String, Option<VeghMetadata>)> {
-    let hash = compute_file_hash(input)?;
+    let hash_bytes = compute_file_hash(input)?;
+    let hash = hex::encode(hash_bytes);
 
     // Try to read meta
     let file = File::open(input)?;
