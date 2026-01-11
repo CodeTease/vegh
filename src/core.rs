@@ -6,9 +6,9 @@ use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom}; // Re-added Read for tar processing/chunks
+use std::io::{Read, Seek, SeekFrom}; 
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -19,7 +19,7 @@ use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-use crate::storage::{FileCacheEntry, VeghCache, ManifestEntry, SnapshotManifest, load_cache, save_cache, CACHE_DIR};
+use crate::storage::{FileCacheEntry, CacheDB, ManifestEntry, SnapshotManifest, CACHE_DIR};
 use crate::hash::{compute_file_hash, compute_chunks, compute_sparse_hash};
 
 // Files that should ALWAYS be included regardless of ignore rules
@@ -73,32 +73,29 @@ pub fn create_snap(
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
 
+    // Ctrl+C handling needs to signal the main loop
+    // But we also need to trigger the cache save.
+    // However, we cannot easily share `CacheDB` with the handler because it's not Send/Sync friendly with open transactions?
+    // Actually, `redb::Database` is thread safe, but `WriteTransaction` is not `Sync`.
+    // So we can't share `txn` across threads.
+    // Strategy: The main loop checks `running`. If false, it breaks and calls `sync_partial`.
+    // We don't do anything in the handler except set the flag.
     let _ = ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
         println!("\n{} Interrupted! Stopping gracefully...", "🛑".red());
     });
 
-    let mut cache = if no_cache {
+    let mut cache_db = if no_cache {
         println!("{} Skipping cache (forced refresh)", "🔄".yellow());
-        VeghCache::default()
+        // For no_cache, we still open the DB but maybe force a clear?
+        // Or just open it (it will clear next tables) and we don't read from active?
+        // Let's just open it normally. If `no_cache` is true, we will just ignore hits.
+        // But we want to WRITE the new cache.
+        CacheDB::open(source)?
     } else {
-        load_cache(source)
+        CacheDB::open(source)?
     };
 
-    // [FV3.1] Build Inode Map for Rename Detection
-    // This is a reverse index: Inode -> FileCacheEntry
-    // Only populated if we are on Unix-like systems where inodes are reliable.
-    #[cfg(unix)]
-    let inode_map: HashMap<u64, &FileCacheEntry> = cache.files.values()
-        .map(|entry| (entry.inode, entry))
-        .filter(|(inode, _)| *inode > 0)
-        .collect();
-    
-    // On non-Unix, empty map
-    #[cfg(not(unix))]
-    let inode_map: HashMap<u64, &FileCacheEntry> = HashMap::new();
-
-    let mut new_cache_files = HashMap::new();
     let file = File::create(output).context("Output file creation failed")?;
     let output_abs = fs::canonicalize(output).unwrap_or(output.to_path_buf());
 
@@ -171,13 +168,9 @@ pub fn create_snap(
         if !running.load(Ordering::SeqCst) {
             pb.finish_with_message("Interrupted!");
             
-            // Merge partial results into original cache
-            cache.files.extend(new_cache_files);
-            
-            // Save cache
+            // Sync partial results
             if !no_cache {
-                 println!("{} Interrupted. Saving progress to cache...", "💾".blue());
-                 if let Err(e) = save_cache(source, &cache) {
+                 if let Err(e) = cache_db.sync_partial() {
                      eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
                  }
             }
@@ -225,7 +218,10 @@ pub fn create_snap(
                 // Compute sparse hash eagerly for verification/storage
                 let sparse_hash = compute_sparse_hash(path, size).ok();
 
-                let (hash, chunks_info, is_cached) = if let Some(cached_entry) = cache.files.get(&name_str) {
+                // Lookup in DB
+                let cached_entry_opt = if no_cache { None } else { cache_db.get(&name_str)? };
+
+                let (hash, chunks_info, is_cached) = if let Some(cached_entry) = cached_entry_opt {
                      // 1. Standard Path Match
                      let mut is_hit = cached_entry.modified == modified 
                                && cached_entry.size == size
@@ -273,12 +269,15 @@ pub fn create_snap(
                      }
                 } else {
                      // 2. Rename Detection (New File path)
-                     // Check if inode exists in cache map
-                     let mut renamed_entry: Option<&FileCacheEntry> = None;
-                     if inode > 0 {
-                         if let Some(entry) = inode_map.get(&inode) {
-                             if entry.size == size && entry.modified == modified && entry.hash.is_some() {
-                                 renamed_entry = Some(entry);
+                     // Check if inode exists in cache DB
+                     let mut renamed_entry: Option<FileCacheEntry> = None;
+                     if !no_cache && inode > 0 {
+                         // Look up path by inode
+                         if let Some(old_path) = cache_db.get_path_by_inode(inode)? {
+                             if let Some(entry) = cache_db.get(&old_path)? {
+                                 if entry.size == size && entry.modified == modified && entry.hash.is_some() {
+                                     renamed_entry = Some(entry);
+                                 }
                              }
                          }
                      }
@@ -293,11 +292,9 @@ pub fn create_snap(
                          };
                          let all_written = cached_chunks.iter().all(|h| written_blobs.contains(h));
                          
-                         // We treat this exactly like a Cache Hit, but we update the path later.
                          if all_written {
                              (cached_hash, None, true)
                          } else {
-                             // We need to read chunks
                              if use_cdc {
                                 let (h, chunks) = compute_chunks(path, CDC_AVG_SIZE)?;
                                 (h, Some(chunks), true)
@@ -319,39 +316,23 @@ pub fn create_snap(
                 };
 
                 if is_cached && chunks_info.is_none() { 
-                    // This happens if "Zero-read optimization" triggered
                     cached_count += 1;
                     pb.set_message(format!("Dedup (Skipped): {}", name.display()));
                     
                     // We need to retrieve chunks from cache to put in manifest
-                    // If it was renamed, it won't be in cache.files.get(&name_str)
-                    // We need to use 'renamed_entry' if available, or 'cached_entry'
+                    // Logic similar to before, but we need to fetch entry again if it was a hit or rename.
                     
-                    // But 'renamed_entry' variable is not available here easily due to scope.
-                    // Actually, 'is_cached' being true implies we found it SOMEWHERE (either path match or rename match).
-                    // If path match: cache.files.get(&name_str) is Some.
-                    // If rename match: cache.files.get(&name_str) is None.
+                    let entry_to_use_opt = if !no_cache {
+                        if let Some(e) = cache_db.get(&name_str)? {
+                            Some(e)
+                        } else if inode > 0 {
+                            if let Some(old_path) = cache_db.get_path_by_inode(inode)? {
+                                cache_db.get(&old_path)?
+                            } else { None }
+                        } else { None }
+                    } else { None };
                     
-                    let entry_to_use = if let Some(e) = cache.files.get(&name_str) {
-                        e.clone()
-                    } else if inode > 0 {
-                         // Must be rename match
-                         // Re-lookup in inode_map
-                         // (Optimization: we could have returned the entry from the if block, but returning references is tricky with lifetimes)
-                         // We know it exists because is_cached is true and it wasn't path match (assuming logic holds)
-                         // Wait, if is_cached is true, it means EITHER path match OR rename match.
-                         // If path match, get(&name_str) works.
-                         // If rename match, get(&name_str) fails.
-                         // So if fails, we check inode map.
-                         if let Some(e) = inode_map.get(&inode) {
-                             (*e).clone()
-                         } else {
-                             // This should not happen if logic is correct
-                             panic!("Logic Error: marked cached but not found");
-                         }
-                    } else {
-                        panic!("Logic Error: marked cached but no inode/path match");
-                    };
+                    let entry_to_use = entry_to_use_opt.expect("Logic Error: marked cached but not found");
 
                     let chunk_hashes = if use_cdc { 
                         entry_to_use.chunks.clone().unwrap_or_else(|| vec![entry_to_use.hash.clone().unwrap_or_default()])
@@ -368,20 +349,15 @@ pub fn create_snap(
                         chunks: Some(chunk_hashes.clone()),
                     });
                     
-                    // We also need to update new_cache
-                    // Note: We insert the OLD entry data (hash/chunks) but with NEW path logic (size/mod/inode/hash from reused entry)
-                    // The entry_to_use has OLD path info? No, FileCacheEntry doesn't store path.
-                    // It stores size, mod, inode, hash, chunks.
-                    // We want to use CURRENT size/mod (which match old one) and OLD hash/chunks.
-                    // Also update inode to current inode (which matches old one).
-                    // So cloning entry_to_use is correct.
                     let mut final_entry = entry_to_use;
-                    // Ensure sparse hash is up to date (though if it matched, it should be same)
-                    // But if it was missing in old entry, we should add it now.
                     if final_entry.sparse_hash.is_none() {
                         final_entry.sparse_hash = sparse_hash.clone();
                     }
-                    new_cache_files.insert(name_str.clone(), final_entry);
+                    // Important: Update inode to current one (if different, e.g. cross-device move simulation? unlikely)
+                    // But definitely ensure we store it with the new path
+                    final_entry.inode = inode;
+                    
+                    cache_db.insert(&name_str, &final_entry)?;
 
                 } else {
                     if is_cached {
@@ -402,14 +378,10 @@ pub fn create_snap(
                              if !written_blobs.contains(&chunk.hash) {
                                  let blob_path = format!("blobs/{}", chunk.hash);
                                  
-                                 // We need to read exact chunk.
-                                 // Seek to offset
                                  f.seek(SeekFrom::Start(chunk.offset as u64))?;
-                                 // Read length
                                  let mut chunk_data = vec![0u8; chunk.length];
                                  f.read_exact(&mut chunk_data)?;
                                  
-                                 // Write to tar
                                  let mut header = tar::Header::new_gnu();
                                  header.set_path(&blob_path)?;
                                  header.set_size(chunk.length as u64);
@@ -431,18 +403,15 @@ pub fn create_snap(
                         }
                     }
 
-                    // Update Cache
-                    new_cache_files.insert(name_str.clone(), FileCacheEntry { 
+                    // Insert into Cache DB
+                    cache_db.insert(&name_str, &FileCacheEntry { 
                         size, 
                         modified,
-                        #[cfg(unix)]
-                        inode: std::os::unix::fs::MetadataExt::ino(&metadata),
-                        #[cfg(not(unix))]
-                        inode: 0,
+                        inode,
                         hash: Some(hash.clone()),
                         chunks: Some(chunk_hashes_list.clone()),
-                        sparse_hash: sparse_hash.clone(), // Store sparse hash
-                    });
+                        sparse_hash: sparse_hash.clone(),
+                    })?;
 
                     // Update Manifest
                     manifest.entries.push(ManifestEntry {
@@ -469,11 +438,9 @@ pub fn create_snap(
     header.set_cksum();
     tar.append_data(&mut header, "manifest.json", manifest_json.as_bytes())?;
 
-    // Update and Save Cache
-    cache.files = new_cache_files;
-    cache.last_snapshot = Utc::now().timestamp();
+    // Commit Cache
     if !no_cache {
-        if let Err(e) = save_cache(source, &cache) {
+        if let Err(e) = cache_db.commit() {
             pb.println(format!(
                 "{} Warning: Failed to save cache: {}",
                 "⚠️".yellow(),
