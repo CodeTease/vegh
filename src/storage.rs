@@ -28,6 +28,13 @@ const TABLE_INODES_V3_B: TableDefinition<u64, &str> = TableDefinition::new("inod
 
 const TABLE_META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct StoredChunk {
+    pub hash: [u8; 32],
+    pub offset: u64,
+    pub length: u32,
+}
+
 // Cache Entry Structure
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct FileCacheEntry {
@@ -48,7 +55,7 @@ pub struct FileCacheEntry {
 
     pub hash: Option<[u8; 32]>,
 
-    // [FV3] Compressed Chunks
+    // [FV3] Compressed Chunks (Now stores serialized Vec<StoredChunk>)
     #[serde(default)]
     pub chunks_compressed: Option<Vec<u8>>,
 
@@ -57,26 +64,41 @@ pub struct FileCacheEntry {
 }
 
 impl FileCacheEntry {
-    pub fn set_chunks(&mut self, chunks: Vec<[u8; 32]>) -> Result<()> {
-        let flat: Vec<u8> = chunks.iter().flat_map(|c| c.iter()).copied().collect();
-        let compressed = zstd::stream::encode_all(Cursor::new(flat), 3)?;
+    pub fn set_chunks(&mut self, chunks: Vec<StoredChunk>) -> Result<()> {
+        // Serialize the Vec<StoredChunk> using bincode
+        let serialized = bincode::serialize(&chunks)?;
+        // Compress using zstd
+        let compressed = zstd::stream::encode_all(Cursor::new(serialized), 3)?;
         self.chunks_compressed = Some(compressed);
         Ok(())
     }
 
-    pub fn get_chunks(&self) -> Result<Option<Vec<[u8; 32]>>> {
+    pub fn get_chunks(&self) -> Result<Option<Vec<StoredChunk>>> {
         if let Some(compressed) = &self.chunks_compressed {
+            // Decompress zstd
             let decompressed = zstd::stream::decode_all(Cursor::new(compressed))?;
-            if decompressed.len() % 32 != 0 {
+            
+            // Try to deserialize as Vec<StoredChunk>
+            if let Ok(chunks) = bincode::deserialize::<Vec<StoredChunk>>(&decompressed) {
+                return Ok(Some(chunks));
+            }
+            
+            // Fallback for legacy format (Vec<[u8; 32]>)
+            // If the buffer length is a multiple of 32, it *might* be the old format.
+            // However, bincode serialization of Vec includes a length prefix (u64).
+            // Old format: flat list of hashes [h1][h2]...
+            // Old format was just bytes. 
+            // In old code:
+            // let flat: Vec<u8> = chunks.iter().flat_map(|c| c.iter()).copied().collect();
+            // So it was just raw bytes concatenated.
+            
+            // If we failed to deserialize as Vec<StoredChunk>, check if it looks like raw hashes
+            if decompressed.len() % 32 == 0 {
+                // Return None to force re-computation/update
                 return Ok(None);
             }
-            let count = decompressed.len() / 32;
-            let mut chunks = Vec::with_capacity(count);
-            for i in 0..count {
-                let slice = &decompressed[i * 32..(i + 1) * 32];
-                chunks.push(slice.try_into()?);
-            }
-            Ok(Some(chunks))
+            
+            Ok(None)
         } else {
             Ok(None)
         }
@@ -289,7 +311,7 @@ impl CacheDB {
                         .and_then(|h| hex::decode(h).ok())
                         .and_then(|v| v.try_into().ok());
 
-                    let mut new_entry = FileCacheEntry {
+                    let new_entry = FileCacheEntry {
                         size: v.size,
                         modified: v.modified,
                         inode: v.inode,
@@ -302,13 +324,8 @@ impl CacheDB {
                         sparse_hash: sparse_bytes,
                     };
 
-                    if let Some(chunks) = v.chunks {
-                        let bin_chunks: Vec<[u8; 32]> = chunks
-                            .into_iter()
-                            .filter_map(|h| hex::decode(h).ok().and_then(|v| v.try_into().ok()))
-                            .collect();
-                        let _ = new_entry.set_chunks(bin_chunks);
-                    }
+                    // Note: Legacy JSON didn't have offset/length for chunks, so we ignore chunks.
+                    // The cache will just recompute them next time.
 
                     let bytes = bincode::serialize(&new_entry)?;
                     data.insert(k.as_str(), bytes.as_slice())?;
