@@ -276,9 +276,7 @@ pub fn create_snap(
                                 || cached_entry.device_id == device_id)
                             && (cached_entry.ctime_sec == 0
                                 || ctime_sec == 0
-                                    // If strict checking is needed, add || cached_entry.ctime_sec == ctime_sec
-                                    // But some filesystems update ctime differently.
-                            )
+                                || cached_entry.ctime_sec == ctime_sec) 
                             && cached_entry.hash.is_some();
                         
                         // If metadata matches, we consider it a hit.
