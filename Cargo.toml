@@ -17,7 +17,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 
 # Signal Handling (Ctrl+C)
-# [NEW] Added to handle graceful shutdowns and save cache
 ctrlc = "3.4"
 
 # File System Walking

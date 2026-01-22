@@ -238,10 +238,9 @@ pub fn create_snap(
                     };
                     #[cfg(windows)]
                     let (mode, inode, device_id, ctime_sec, ctime_nsec) = {
-                        use std::os::windows::fs::MetadataExt;
-                        let inode = metadata.file_index().unwrap_or(0);
-                        let dev = metadata.volume_serial_number().unwrap_or(0) as u64;
-                        (0o644, inode, dev, 0, 0)
+                        // Unstable features (file_index, volume_serial_number) replaced with 0
+                        // to ensure stable compilation.
+                        (0o644, 0, 0, 0, 0)
                     };
                     #[cfg(not(any(unix, windows)))]
                     let (mode, inode, device_id, ctime_sec, ctime_nsec) = (0o644, 0, 0, 0, 0);
@@ -549,8 +548,6 @@ pub fn create_snap(
     Ok((total_raw_size, final_size))
 }
 
-// ... Unchanged helpers ...
-// I need to include the rest of the file or it gets truncated!
 pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
     if !out_dir.exists() {
         fs::create_dir_all(out_dir)?;

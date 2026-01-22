@@ -88,12 +88,6 @@ async fn main() -> Result<()> {
         Commands::Check { file } => {
             println!("{} Checking '{}'...", "🔍".yellow(), file.display());
             
-            // Note: check_integrity is now in hash.rs but called via core re-export or I need to import it from hash module directly?
-            // In step 4 I put it in `src/hash.rs`. But in `src/core.rs` I did NOT put `check_integrity`.
-            // Wait, I missed moving `check_integrity` to `core.rs` in Step 4.
-            // But I put it in `hash.rs` in Step 3.
-            // So main should import it from `hash` module.
-            
             let task = tokio::task::spawn_blocking(move || crate::hash::check_integrity(&file));
             let (hash, meta) = task.await??;
 
