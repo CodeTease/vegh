@@ -524,8 +524,13 @@ pub fn create_snap(
 
     if !no_cache {
         println!("{} Running garbage collection...", "🧹".blue());
-        if let Err(e) = cache_db.garbage_collect_and_merge(CACHE_RETENTION_SEC) {
-            eprintln!("{} GC Warning: {}", "⚠️".yellow(), e);
+        match cache_db.garbage_collect(CACHE_RETENTION_SEC) {
+            Ok(count) => {
+                if count > 0 {
+                    println!("{} GC: Removed {} expired entries", "🧹".blue(), count);
+                }
+            }
+            Err(e) => eprintln!("{} GC Warning: {}", "⚠️".yellow(), e),
         }
         if let Err(e) = cache_db.commit() {
              eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
