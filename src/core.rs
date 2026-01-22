@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use colored::*;
-use crossbeam_channel::{bounded};
+use crossbeam_channel::bounded;
 use futures::stream::{self, StreamExt};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -19,8 +19,8 @@ use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-use crate::storage::{FileCacheEntry, CacheDB, ManifestEntry, SnapshotManifest, CACHE_DIR};
-use crate::hash::{compute_file_hash, compute_chunks, compute_sparse_hash};
+use crate::hash::{compute_chunks, compute_file_hash, compute_sparse_hash};
+use crate::storage::{CACHE_DIR, CacheDB, FileCacheEntry, ManifestEntry, SnapshotManifest};
 
 // Files that should ALWAYS be included regardless of ignore rules
 const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
@@ -85,8 +85,8 @@ struct MetadataInfo {
 }
 
 enum DataAction {
-    Cached, // All data in cache/blobs already
-    WriteFile(Vec<u8>), // Hash bytes
+    Cached,                      // All data in cache/blobs already
+    WriteFile(Vec<u8>),          // Hash bytes
     WriteChunks(Vec<ChunkData>), // List of chunks to write
 }
 
@@ -188,25 +188,27 @@ pub fn create_snap(
         builder.hidden(true).git_ignore(true).overrides(overrides);
 
         for result in builder.build() {
-            if !r_scan.load(Ordering::SeqCst) { break; }
-            if let Ok(entry) = result {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                     if let Ok(abs) = fs::canonicalize(entry.path()) {
-                         if abs == output_abs { continue; }
-                     }
-                     if path_tx_for_scan.send(entry.path().to_path_buf()).is_err() {
-                         break;
-                     }
-                }
+            if !r_scan.load(Ordering::SeqCst) {
+                break;
             }
+            if let Ok(entry) = result
+                && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    if let Ok(abs) = fs::canonicalize(entry.path())
+                        && abs == output_abs {
+                            continue;
+                        }
+                    if path_tx_for_scan.send(entry.path().to_path_buf()).is_err() {
+                        break;
+                    }
+                }
         }
     });
 
     // 3. Worker Threads
     let mut worker_handles = Vec::new();
-    let cache_reader = cache_db.reader(); 
-    let written_blobs = Arc::new(dashmap::DashMap::new()); 
-    
+    let cache_reader = cache_db.reader();
+    let written_blobs = Arc::new(dashmap::DashMap::new());
+
     let written_blobs_shared = written_blobs.clone();
     let _source_path_str = source.to_string_lossy().to_string();
 
@@ -220,21 +222,33 @@ pub fn create_snap(
 
         worker_handles.push(std::thread::spawn(move || {
             while let Ok(path) = rx.recv() {
-                if !r_worker.load(Ordering::SeqCst) { break; }
-                
+                if !r_worker.load(Ordering::SeqCst) {
+                    break;
+                }
+
                 // Process File
                 let process_res = (|| -> Result<ProcessedMessage> {
                     let name = path.strip_prefix(&src_root).unwrap_or(&path);
                     let name_str = name.to_string_lossy().to_string();
                     let metadata = path.metadata()?;
                     let size = metadata.len();
-                    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
-                        .duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let modified = metadata
+                        .modified()
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
 
                     #[cfg(unix)]
                     let (mode, inode, device_id, ctime_sec, ctime_nsec) = {
                         use std::os::unix::fs::MetadataExt;
-                        (metadata.mode(), metadata.ino(), metadata.dev(), metadata.ctime(), metadata.ctime_nsec() as u32)
+                        (
+                            metadata.mode(),
+                            metadata.ino(),
+                            metadata.dev(),
+                            metadata.ctime(),
+                            metadata.ctime_nsec() as u32,
+                        )
                     };
                     #[cfg(windows)]
                     let (mode, inode, device_id, ctime_sec, ctime_nsec) = {
@@ -245,108 +259,118 @@ pub fn create_snap(
                     #[cfg(not(any(unix, windows)))]
                     let (mode, inode, device_id, ctime_sec, ctime_nsec) = (0o644, 0, 0, 0, 0);
 
-                    let now_ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+                    let now_ts = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
                     let use_cdc = size > CDC_THRESHOLD;
 
                     let sparse_hash = compute_sparse_hash(&path, size).ok();
-                    let cached_entry_opt = if no_cache { None } else { reader.get(&name_str)? };
-
-                    let (hash, chunks_info, is_cached_hit) = if let Some(cached_entry) = cached_entry_opt {
-                         let mut is_hit = cached_entry.modified == modified 
-                                   && cached_entry.size == size
-                                   && cached_entry.inode == inode
-                                   && (cached_entry.device_id == 0 || device_id == 0 || cached_entry.device_id == device_id)
-                                   && (cached_entry.ctime_sec == 0 || ctime_sec == 0 || cached_entry.ctime_sec == ctime_sec) 
-                                   && cached_entry.hash.is_some();
-                         
-                         if is_hit && use_cdc {
-                             // Check if chunks exist in entry
-                             is_hit = cached_entry.get_chunks().ok().flatten().is_some();
-                         }
-                         
-                         if is_hit {
-                             if let Some(cached_sparse) = &cached_entry.sparse_hash {
-                                 if let Some(current_sparse) = &sparse_hash {
-                                     if cached_sparse != current_sparse { is_hit = false; }
-                                 }
-                             }
-                         }
-
-                         if is_hit {
-                             let cached_hash = cached_entry.hash.clone().unwrap();
-                             let cached_chunks = if use_cdc { 
-                                 cached_entry.get_chunks()?.unwrap() 
-                             } else { 
-                                 vec![cached_hash.clone()] 
-                             };
-                             
-                             let all_written = cached_chunks.iter().all(|h| blobs.contains_key(&hex::encode(h)));
-                             
-                             if all_written {
-                                 (cached_hash, None, true)
-                             } else {
-                                 // Re-read needed
-                                 if use_cdc {
-                                    let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
-                                    (h, Some(chunks), true)
-                                 } else {
-                                    let h = compute_file_hash(&path)?;
-                                    (h, None, true)
-                                 }
-                             }
-                         } else {
-                             // Miss
-                             if use_cdc {
-                                 let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
-                                 (h, Some(chunks), false)
-                             } else {
-                                 let h = compute_file_hash(&path)?;
-                                 (h, None, false)
-                             }
-                         }
+                    let cached_entry_opt = if no_cache {
+                        None
                     } else {
-                         // Rename check
-                         let mut renamed_entry: Option<FileCacheEntry> = None;
-                         if !no_cache && inode > 0 {
-                             if let Some(old_path) = reader.get_path_by_inode(inode)? {
-                                 if let Some(entry) = reader.get(&old_path)? {
-                                     if entry.size == size && entry.modified == modified {
-                                         renamed_entry = Some(entry);
-                                     }
-                                 }
-                             }
-                         }
+                        reader.get(&name_str)?
+                    };
 
-                         if let Some(entry) = renamed_entry {
-                             let cached_hash = entry.hash.clone().unwrap_or_default();
-                             let cached_chunks = if use_cdc { 
-                                 entry.get_chunks()?.unwrap_or_else(|| vec![cached_hash.clone()]) 
-                             } else { 
-                                 vec![cached_hash.clone()] 
-                             };
-                             let all_written = cached_chunks.iter().all(|h| blobs.contains_key(&hex::encode(h)));
-                             
-                             if all_written {
-                                 (cached_hash, None, true)
-                             } else {
-                                 if use_cdc {
+                    let (hash, chunks_info, is_cached_hit) =
+                        if let Some(cached_entry) = cached_entry_opt {
+                            let mut is_hit = cached_entry.modified == modified
+                                && cached_entry.size == size
+                                && cached_entry.inode == inode
+                                && (cached_entry.device_id == 0
+                                    || device_id == 0
+                                    || cached_entry.device_id == device_id)
+                                && (cached_entry.ctime_sec == 0
+                                    || ctime_sec == 0
+                                    || cached_entry.ctime_sec == ctime_sec)
+                                && cached_entry.hash.is_some();
+
+                            if is_hit && use_cdc {
+                                // Check if chunks exist in entry
+                                is_hit = cached_entry.get_chunks().ok().flatten().is_some();
+                            }
+
+                            if is_hit
+                                && let Some(cached_sparse) = &cached_entry.sparse_hash
+                                    && let Some(current_sparse) = &sparse_hash
+                                        && cached_sparse != current_sparse {
+                                            is_hit = false;
+                                        }
+
+                            if is_hit {
+                                let cached_hash = cached_entry.hash.unwrap();
+                                let cached_chunks = if use_cdc {
+                                    cached_entry.get_chunks()?.unwrap()
+                                } else {
+                                    vec![cached_hash]
+                                };
+
+                                let all_written = cached_chunks
+                                    .iter()
+                                    .all(|h| blobs.contains_key(&hex::encode(h)));
+
+                                if all_written {
+                                    (cached_hash, None, true)
+                                } else {
+                                    // Re-read needed
+                                    if use_cdc {
+                                        let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                        (h, Some(chunks), true)
+                                    } else {
+                                        let h = compute_file_hash(&path)?;
+                                        (h, None, true)
+                                    }
+                                }
+                            } else {
+                                // Miss
+                                if use_cdc {
+                                    let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                    (h, Some(chunks), false)
+                                } else {
+                                    let h = compute_file_hash(&path)?;
+                                    (h, None, false)
+                                }
+                            }
+                        } else {
+                            // Rename check
+                            let mut renamed_entry: Option<FileCacheEntry> = None;
+                            if !no_cache && inode > 0
+                                && let Some(old_path) = reader.get_path_by_inode(inode)?
+                                    && let Some(entry) = reader.get(&old_path)?
+                                        && entry.size == size && entry.modified == modified {
+                                            renamed_entry = Some(entry);
+                                        }
+
+                            if let Some(entry) = renamed_entry {
+                                let cached_hash = entry.hash.unwrap_or_default();
+                                let cached_chunks = if use_cdc {
+                                    entry
+                                        .get_chunks()?
+                                        .unwrap_or_else(|| vec![cached_hash])
+                                } else {
+                                    vec![cached_hash]
+                                };
+                                let all_written = cached_chunks
+                                    .iter()
+                                    .all(|h| blobs.contains_key(&hex::encode(h)));
+
+                                if all_written {
+                                    (cached_hash, None, true)
+                                } else if use_cdc {
                                     let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
                                     (h, Some(chunks), true)
-                                 } else {
+                                } else {
                                     let h = compute_file_hash(&path)?;
                                     (h, None, true)
-                                 }
-                             }
-                         } else {
-                             if use_cdc {
-                                 let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
-                                 (h, Some(chunks), false)
-                             } else {
-                                 let h = compute_file_hash(&path)?;
-                                 (h, None, false)
-                             }
-                         }
-                    };
+                                }
+                            } else if use_cdc {
+                                let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                (h, Some(chunks), false)
+                            } else {
+                                let h = compute_file_hash(&path)?;
+                                (h, None, false)
+                            }
+                        };
 
                     // Construct Result
                     let mut data_action = DataAction::Cached;
@@ -355,21 +379,21 @@ pub fn create_snap(
                     if let Some(chunks) = chunks_info {
                         let mut chunks_to_write = Vec::new();
                         for c in chunks {
-                             chunk_hashes_bin.push(c.hash.clone());
-                             let hex_h = hex::encode(c.hash);
-                             if !blobs.contains_key(&hex_h) {
-                                 chunks_to_write.push(ChunkData {
-                                     hash: c.hash,
-                                     offset: c.offset as u64,
-                                     length: c.length,
-                                 });
-                             }
+                            chunk_hashes_bin.push(c.hash);
+                            let hex_h = hex::encode(c.hash);
+                            if !blobs.contains_key(&hex_h) {
+                                chunks_to_write.push(ChunkData {
+                                    hash: c.hash,
+                                    offset: c.offset as u64,
+                                    length: c.length,
+                                });
+                            }
                         }
                         if !chunks_to_write.is_empty() {
                             data_action = DataAction::WriteChunks(chunks_to_write);
                         }
                     } else {
-                        chunk_hashes_bin.push(hash.clone());
+                        chunk_hashes_bin.push(hash);
                         let hex_h = hex::encode(hash);
                         if !blobs.contains_key(&hex_h) {
                             data_action = DataAction::WriteFile(hash.to_vec());
@@ -394,17 +418,24 @@ pub fn create_snap(
                     Ok(ProcessedMessage {
                         path_str: name_str,
                         abs_path: path,
-                        metadata_info: MetadataInfo { size, modified, mode },
+                        metadata_info: MetadataInfo {
+                            size,
+                            modified,
+                            mode,
+                        },
                         entry,
                         data_action,
                         is_cached_hit,
                     })
-
                 })();
 
                 match process_res {
-                    Ok(msg) => { let _ = tx.send(WorkerResult::Processed(msg)); },
-                    Err(e) => { let _ = tx.send(WorkerResult::Error(e.to_string())); }
+                    Ok(msg) => {
+                        let _ = tx.send(WorkerResult::Processed(msg));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(WorkerResult::Error(e.to_string()));
+                    }
                 }
             }
         }));
@@ -419,92 +450,100 @@ pub fn create_snap(
     let mut total_raw_size = 0;
     let mut manifest = SnapshotManifest::default();
     let mut batch_counter = 0;
-    
+
     while let Ok(msg) = res_rx.recv() {
-         if !running.load(Ordering::SeqCst) { break; }
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
 
-         match msg {
-             WorkerResult::Error(e) => {
-                 eprintln!("{} Error: {}", "⚠️".yellow(), e);
-             }
-             WorkerResult::Processed(pm) => {
-                 total_raw_size += pm.metadata_info.size;
-                 
-                 // Handle Data Writing
-                 match pm.data_action {
-                     DataAction::Cached => {
-                         // Nothing to write
-                         if pm.is_cached_hit {
-                             pb.set_message(format!("Dedup: {}", pm.path_str));
-                             cached_count += 1;
-                         }
-                     }
-                     DataAction::WriteFile(hash_bytes) => {
-                         let hash_hex = hex::encode(&hash_bytes);
-                         if !written_blobs.contains_key(&hash_hex) {
-                             pb.set_message(format!("Writing: {}", pm.path_str));
-                             let blob_path = format!("blobs/{}", hash_hex);
-                             let mut f = File::open(&pm.abs_path)?;
-                             tar.append_file(&blob_path, &mut f)?;
-                             written_blobs.insert(hash_hex, ());
-                         } else {
-                              pb.set_message(format!("Dedup: {}", pm.path_str));
-                         }
-                     }
-                     DataAction::WriteChunks(chunks) => {
-                         pb.set_message(format!("Chunking: {}", pm.path_str));
-                         let mut f = File::open(&pm.abs_path)?;
-                         for chunk in chunks {
-                             let chunk_hex = hex::encode(chunk.hash);
-                             if !written_blobs.contains_key(&chunk_hex) {
-                                 let blob_path = format!("blobs/{}", chunk_hex);
-                                 f.seek(SeekFrom::Start(chunk.offset))?;
-                                 let mut chunk_buf = vec![0u8; chunk.length];
-                                 f.read_exact(&mut chunk_buf)?;
-                                 
-                                 let mut header = tar::Header::new_gnu();
-                                 header.set_path(&blob_path)?;
-                                 header.set_size(chunk.length as u64);
-                                 header.set_mode(0o644);
-                                 header.set_cksum();
-                                 tar.append_data(&mut header, &blob_path, &chunk_buf[..])?;
-                                 
-                                 written_blobs.insert(chunk_hex, ());
-                             }
-                         }
-                     }
-                 }
+        match msg {
+            WorkerResult::Error(e) => {
+                eprintln!("{} Error: {}", "⚠️".yellow(), e);
+            }
+            WorkerResult::Processed(pm) => {
+                total_raw_size += pm.metadata_info.size;
 
-                 // Update Cache DB
-                 cache_db.insert(&pm.path_str, &pm.entry)?;
-                 
-                 // Update Manifest
-                 let chunk_hashes_hex: Option<Vec<String>> = pm.entry.get_chunks().ok().flatten()
-                     .map(|v| v.iter().map(|h| hex::encode(h)).collect());
-                 
-                 manifest.entries.push(ManifestEntry {
-                     path: pm.path_str,
-                     hash: hex::encode(pm.entry.hash.unwrap_or_default()),
-                     size: pm.metadata_info.size,
-                     modified: pm.metadata_info.modified,
-                     mode: pm.metadata_info.mode,
-                     chunks: chunk_hashes_hex,
-                 });
+                // Handle Data Writing
+                match pm.data_action {
+                    DataAction::Cached => {
+                        // Nothing to write
+                        if pm.is_cached_hit {
+                            pb.set_message(format!("Dedup: {}", pm.path_str));
+                            cached_count += 1;
+                        }
+                    }
+                    DataAction::WriteFile(hash_bytes) => {
+                        let hash_hex = hex::encode(&hash_bytes);
+                        if !written_blobs.contains_key(&hash_hex) {
+                            pb.set_message(format!("Writing: {}", pm.path_str));
+                            let blob_path = format!("blobs/{}", hash_hex);
+                            let mut f = File::open(&pm.abs_path)?;
+                            tar.append_file(&blob_path, &mut f)?;
+                            written_blobs.insert(hash_hex, ());
+                        } else {
+                            pb.set_message(format!("Dedup: {}", pm.path_str));
+                        }
+                    }
+                    DataAction::WriteChunks(chunks) => {
+                        pb.set_message(format!("Chunking: {}", pm.path_str));
+                        let mut f = File::open(&pm.abs_path)?;
+                        for chunk in chunks {
+                            let chunk_hex = hex::encode(chunk.hash);
+                            if !written_blobs.contains_key(&chunk_hex) {
+                                let blob_path = format!("blobs/{}", chunk_hex);
+                                f.seek(SeekFrom::Start(chunk.offset))?;
+                                let mut chunk_buf = vec![0u8; chunk.length];
+                                f.read_exact(&mut chunk_buf)?;
 
-                 count += 1;
-                 batch_counter += 1;
-                 
-                 if batch_counter >= BATCH_COMMIT_SIZE {
-                     cache_db.commit_batch()?;
-                     batch_counter = 0;
-                 }
-             }
-         }
+                                let mut header = tar::Header::new_gnu();
+                                header.set_path(&blob_path)?;
+                                header.set_size(chunk.length as u64);
+                                header.set_mode(0o644);
+                                header.set_cksum();
+                                tar.append_data(&mut header, &blob_path, &chunk_buf[..])?;
+
+                                written_blobs.insert(chunk_hex, ());
+                            }
+                        }
+                    }
+                }
+
+                // Update Cache DB
+                cache_db.insert(&pm.path_str, &pm.entry)?;
+
+                // Update Manifest
+                let chunk_hashes_hex: Option<Vec<String>> = pm
+                    .entry
+                    .get_chunks()
+                    .ok()
+                    .flatten()
+                    .map(|v| v.iter().map(hex::encode).collect());
+
+                manifest.entries.push(ManifestEntry {
+                    path: pm.path_str,
+                    hash: hex::encode(pm.entry.hash.unwrap_or_default()),
+                    size: pm.metadata_info.size,
+                    modified: pm.metadata_info.modified,
+                    mode: pm.metadata_info.mode,
+                    chunks: chunk_hashes_hex,
+                });
+
+                count += 1;
+                batch_counter += 1;
+
+                if batch_counter >= BATCH_COMMIT_SIZE {
+                    cache_db.commit_batch()?;
+                    batch_counter = 0;
+                }
+            }
+        }
     }
 
     let _ = scanner_handle.join();
-    for h in worker_handles { let _ = h.join(); }
-    
+    for h in worker_handles {
+        let _ = h.join();
+    }
+
     if !running.load(Ordering::SeqCst) {
         pb.finish_with_message("Interrupted!");
         if !no_cache {
@@ -532,13 +571,16 @@ pub fn create_snap(
             Err(e) => eprintln!("{} GC Warning: {}", "⚠️".yellow(), e),
         }
         if let Err(e) = cache_db.commit() {
-             eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
+            eprintln!("{} Failed to save cache: {}", "⚠️".yellow(), e);
         }
     }
 
     pb.finish_with_message(format!(
         "Packed {} files ({} cached, {} blobs) using {} threads.",
-        count, cached_count, written_blobs.len(), num_threads
+        count,
+        cached_count,
+        written_blobs.len(),
+        num_threads
     ));
 
     let zstd_encoder = tar.into_inner()?;
@@ -558,7 +600,7 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(decoder);
 
     archive.unpack(out_dir)?;
-    
+
     let manifest_path = out_dir.join("manifest.json");
     if !manifest_path.exists() {
         return Ok(());
@@ -566,28 +608,33 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
 
     let manifest_file = File::open(&manifest_path)?;
     let manifest: SnapshotManifest = serde_json::from_reader(manifest_file)?;
-    
+
     let blobs_dir = out_dir.join("blobs");
-    
+
     println!("{} Reconstructing files from blobs...", "🔨".cyan());
     let pb = ProgressBar::new(manifest.entries.len() as u64);
-    
+
     for entry in manifest.entries {
         let dest_path = out_dir.join(&entry.path);
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        
+
         let mut dest_file = File::create(&dest_path)?;
         let chunk_hashes = entry.chunks.unwrap_or_else(|| vec![entry.hash.clone()]);
-        
+
         for chunk_hash in chunk_hashes {
             let blob_path = blobs_dir.join(&chunk_hash);
             if blob_path.exists() {
                 let mut blob_file = File::open(&blob_path)?;
                 std::io::copy(&mut blob_file, &mut dest_file)?;
             } else {
-                 pb.println(format!("{} Missing blob {} for {}", "⚠️".yellow(), chunk_hash, entry.path));
+                pb.println(format!(
+                    "{} Missing blob {} for {}",
+                    "⚠️".yellow(),
+                    chunk_hash,
+                    entry.path
+                ));
             }
         }
 
@@ -597,10 +644,10 @@ pub fn restore_snap(input: &Path, out_dir: &Path) -> Result<()> {
             let permissions = fs::Permissions::from_mode(entry.mode);
             fs::set_permissions(&dest_path, permissions)?;
         }
-        
+
         pb.inc(1);
     }
-    
+
     pb.finish_with_message("Restoration Complete!");
 
     let _ = fs::remove_file(manifest_path);
@@ -617,36 +664,37 @@ pub fn list_snap(input: &Path) -> Result<()> {
 
     println!("{} Contents of {}:", "📂".cyan(), input.display());
     println!("{:-<50}", "-");
-    
+
     let mut manifest_found = false;
-    
+
     for entry in archive.entries()? {
         let entry = entry?;
         let path = entry.path()?;
         let path_str = path.to_string_lossy();
-        
+
         if path_str == "manifest.json" {
-             let manifest: SnapshotManifest = serde_json::from_reader(entry)?;
-             for item in manifest.entries {
-                 let chunks_count = item.chunks.as_ref().map(|c| c.len()).unwrap_or(1);
-                 println!("{:<40} {:>8} bytes [Chunks: {}] [{}]", 
-                    item.path, 
-                    item.size, 
+            let manifest: SnapshotManifest = serde_json::from_reader(entry)?;
+            for item in manifest.entries {
+                let chunks_count = item.chunks.as_ref().map(|c| c.len()).unwrap_or(1);
+                println!(
+                    "{:<40} {:>8} bytes [Chunks: {}] [{}]",
+                    item.path,
+                    item.size,
                     chunks_count,
                     item.hash.chars().take(8).collect::<String>()
                 );
-             }
-             manifest_found = true;
-             break; 
+            }
+            manifest_found = true;
+            break;
         } else if !path_str.starts_with("blobs/") && path_str != ".vegh.json" {
             println!("{:<40} {:>8} bytes", path.display(), entry.size());
         }
     }
-    
+
     if !manifest_found {
         println!("(Legacy Archive or No Manifest found)");
     }
-    
+
     Ok(())
 }
 
@@ -656,7 +704,6 @@ pub async fn send_file(
     force_chunk: bool,
     auth_token: Option<String>,
 ) -> Result<()> {
-    
     if !path.exists() {
         anyhow::bail!("File not found: {}", path.display());
     }
@@ -677,7 +724,7 @@ pub async fn send_file(
         println!("{} Authentication: Enabled", "🔒".green());
     }
 
-    const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024; 
+    const CHUNK_THRESHOLD: u64 = 100 * 1024 * 1024;
 
     if file_size < CHUNK_THRESHOLD && !force_chunk {
         println!("{} Mode: Streaming Direct Upload", "🌊".yellow());
@@ -711,7 +758,7 @@ pub async fn send_streaming(
 
     let mut request = client
         .post(url)
-        .header("Content-Length", file_size) 
+        .header("Content-Length", file_size)
         .header("User-Agent", "CodeTease-Vegh/0.3.0");
 
     if let Some(token) = auth_token {
@@ -813,7 +860,7 @@ pub async fn send_chunked(
                 }
             }
         })
-        .buffer_unordered(4); 
+        .buffer_unordered(4);
 
     let results: Vec<Result<()>> = stream.collect().await;
     for res in results {

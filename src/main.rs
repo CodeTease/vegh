@@ -4,14 +4,14 @@ mod hash;
 mod storage;
 
 use anyhow::Result;
+use chrono::Utc;
 use clap::Parser;
 use colored::*;
 use std::path::PathBuf;
 use std::time::Instant;
-use chrono::Utc;
 
 use cli::{Cli, Commands};
-use core::{create_snap, restore_snap, list_snap, send_file, format_bytes};
+use core::{create_snap, format_bytes, list_snap, restore_snap, send_file};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
         }
         Commands::Check { file } => {
             println!("{} Checking '{}'...", "🔍".yellow(), file.display());
-            
+
             let task = tokio::task::spawn_blocking(move || crate::hash::check_integrity(&file));
             let (hash, meta) = task.await??;
 
