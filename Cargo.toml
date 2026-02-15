@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["CodeTease"]
 description = "A lightweight, fast snapshot tool for developers."
 repository = "https://github.com/CodeTease/vegh"
+homepage = "https://github.com/CodeTease/vegh"
 
 [package.metadata.wix]
 upgrade-guid = "6C767EAA-D193-4602-9300-3FCBC13B740B"
