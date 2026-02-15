@@ -20,7 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
 use crate::hash::{compute_chunks, compute_file_hash, compute_sparse_hash};
-use crate::storage::{CACHE_DIR, CacheDB, FileCacheEntry, ManifestEntry, SnapshotManifest, StoredChunk};
+use crate::storage::{
+    CACHE_DIR, CacheDB, FileCacheEntry, ManifestEntry, SnapshotManifest, StoredChunk,
+};
 
 // Files that should ALWAYS be included regardless of ignore rules
 const PRESERVED_FILES: &[&str] = &[".veghignore", ".gitignore"];
@@ -85,8 +87,8 @@ struct MetadataInfo {
 }
 
 enum DataAction {
-    Cached,                      // All data in cache/blobs already
-    WriteFile(Vec<u8>),          // Hash bytes
+    Cached,                        // All data in cache/blobs already
+    WriteFile(Vec<u8>),            // Hash bytes
     WriteChunks(Vec<StoredChunk>), // List of chunks to write
 }
 
@@ -120,11 +122,11 @@ pub fn create_snap(
     let output_abs = fs::canonicalize(output).unwrap_or(output.to_path_buf());
 
     let meta = VeghMetadata {
-        author: "CodeTease".to_string(),
+        author: "Vegh".to_string(),
         timestamp: Utc::now().timestamp(),
         timestamp_human: Some(Utc::now().to_rfc3339()),
         comment: comment.unwrap_or_default(),
-        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        tool_version: "Vegh ".to_string() + env!("CARGO_PKG_VERSION"),
         format_version: SNAPSHOT_FORMAT_VERSION.to_string(),
     };
     let meta_json = serde_json::to_string_pretty(&meta)?;
@@ -188,15 +190,17 @@ pub fn create_snap(
                 break;
             }
             if let Ok(entry) = result
-                && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    if let Ok(abs) = fs::canonicalize(entry.path())
-                        && abs == output_abs {
-                            continue;
-                        }
-                    if path_tx_for_scan.send(entry.path().to_path_buf()).is_err() {
-                        break;
-                    }
+                && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+            {
+                if let Ok(abs) = fs::canonicalize(entry.path())
+                    && abs == output_abs
+                {
+                    continue;
                 }
+                if path_tx_for_scan.send(entry.path().to_path_buf()).is_err() {
+                    break;
+                }
+            }
         }
     });
 
@@ -267,74 +271,84 @@ pub fn create_snap(
                         reader.get(&name_str)?
                     };
 
-                    let (hash, chunks_info, is_cached_hit) = if let Some(ref cached_entry) = cached_entry_opt {
-                        let is_hit = cached_entry.modified == modified
-                            && cached_entry.size == size
-                            && cached_entry.inode == inode
-                            && (cached_entry.device_id == 0
-                                || device_id == 0
-                                || cached_entry.device_id == device_id)
-                            && (cached_entry.ctime_sec == 0
-                                || ctime_sec == 0
-                                || cached_entry.ctime_sec == ctime_sec) 
-                            && cached_entry.hash.is_some();
-                        
-                        // If metadata matches, we consider it a hit.
-                        if is_hit {
-                             // Check if we have chunks if CDC is expected
-                            if use_cdc {
-                                if let Ok(Some(chunks)) = cached_entry.get_chunks() {
-                                    // We have chunks, great!
-                                    (cached_entry.hash.unwrap(), Some(chunks), true)
+                    let (hash, chunks_info, is_cached_hit) =
+                        if let Some(ref cached_entry) = cached_entry_opt {
+                            let is_hit = cached_entry.modified == modified
+                                && cached_entry.size == size
+                                && cached_entry.inode == inode
+                                && (cached_entry.device_id == 0
+                                    || device_id == 0
+                                    || cached_entry.device_id == device_id)
+                                && (cached_entry.ctime_sec == 0
+                                    || ctime_sec == 0
+                                    || cached_entry.ctime_sec == ctime_sec)
+                                && cached_entry.hash.is_some();
+
+                            // If metadata matches, we consider it a hit.
+                            if is_hit {
+                                // Check if we have chunks if CDC is expected
+                                if use_cdc {
+                                    if let Ok(Some(chunks)) = cached_entry.get_chunks() {
+                                        // We have chunks, great!
+                                        (cached_entry.hash.unwrap(), Some(chunks), true)
+                                    } else {
+                                        // Metadata matches but we don't have valid chunks (maybe migrated from old format)
+                                        // We must recompute.
+                                        let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+
+                                        // Convert hash::ChunkInfo to storage::StoredChunk
+                                        let stored_chunks: Vec<StoredChunk> = chunks
+                                            .into_iter()
+                                            .map(|c| StoredChunk {
+                                                hash: c.hash,
+                                                offset: c.offset as u64,
+                                                length: c.length as u32,
+                                            })
+                                            .collect();
+
+                                        (h, Some(stored_chunks), false)
+                                    }
                                 } else {
-                                    // Metadata matches but we don't have valid chunks (maybe migrated from old format)
-                                    // We must recompute.
+                                    // No CDC, just simple hash
+                                    (cached_entry.hash.unwrap(), None, true)
+                                }
+                            } else {
+                                // Metadata mismatch -> Recompute
+                                if use_cdc {
                                     let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
-                                    
-                                    // Convert hash::ChunkInfo to storage::StoredChunk
-                                    let stored_chunks: Vec<StoredChunk> = chunks.into_iter().map(|c| StoredChunk {
+                                    let stored_chunks: Vec<StoredChunk> = chunks
+                                        .into_iter()
+                                        .map(|c| StoredChunk {
+                                            hash: c.hash,
+                                            offset: c.offset as u64,
+                                            length: c.length as u32,
+                                        })
+                                        .collect();
+                                    (h, Some(stored_chunks), false)
+                                } else {
+                                    let h = compute_file_hash(&path)?;
+                                    (h, None, false)
+                                }
+                            }
+                        } else {
+                            // Not in cache -> Compute
+                            if use_cdc {
+                                let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
+                                let stored_chunks: Vec<StoredChunk> = chunks
+                                    .into_iter()
+                                    .map(|c| StoredChunk {
                                         hash: c.hash,
                                         offset: c.offset as u64,
                                         length: c.length as u32,
-                                    }).collect();
-                                    
-                                    (h, Some(stored_chunks), false)
-                                }
-                            } else {
-                                // No CDC, just simple hash
-                                (cached_entry.hash.unwrap(), None, true)
-                            }
-                        } else {
-                            // Metadata mismatch -> Recompute
-                             if use_cdc {
-                                let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
-                                let stored_chunks: Vec<StoredChunk> = chunks.into_iter().map(|c| StoredChunk {
-                                    hash: c.hash,
-                                    offset: c.offset as u64,
-                                    length: c.length as u32,
-                                }).collect();
+                                    })
+                                    .collect();
                                 (h, Some(stored_chunks), false)
                             } else {
                                 let h = compute_file_hash(&path)?;
                                 (h, None, false)
                             }
-                        }
-                    } else {
-                         // Not in cache -> Compute
-                        if use_cdc {
-                            let (h, chunks) = compute_chunks(&path, CDC_AVG_SIZE)?;
-                            let stored_chunks: Vec<StoredChunk> = chunks.into_iter().map(|c| StoredChunk {
-                                    hash: c.hash,
-                                    offset: c.offset as u64,
-                                    length: c.length as u32,
-                                }).collect();
-                            (h, Some(stored_chunks), false)
-                        } else {
-                            let h = compute_file_hash(&path)?;
-                            (h, None, false)
-                        }
-                    };
-                    
+                        };
+
                     // Note: We REMOVED the "is content already in blobs?" check from the Cache Hit logic.
                     // That check now happens ONLY when deciding whether to write data (DataAction).
                     // This satisfies "Point 1: Validation Point Shift".
@@ -342,7 +356,8 @@ pub fn create_snap(
                     // Construct Result
                     let mut data_action = DataAction::Cached;
 
-                    if let Some(chunks) = chunks_info.clone() { // Clone needed? chunks_info is moved into entry later if we are not careful
+                    if let Some(chunks) = chunks_info.clone() {
+                        // Clone needed? chunks_info is moved into entry later if we are not careful
                         let mut chunks_to_write = Vec::new();
                         for c in chunks {
                             let hex_h = hex::encode(c.hash);
@@ -374,7 +389,7 @@ pub fn create_snap(
                         chunks_compressed: None, // Set below
                         sparse_hash: None, // We stopped computing sparse hash for every file to match "Skip Compute"
                     };
-                    
+
                     // Should we compute sparse hash for new files?
                     // The prompt says "Trust-but-Verify... Mismatches trigger full re-hash".
                     // But also "Totally skip step calculation BLAKE3".
@@ -388,15 +403,15 @@ pub fn create_snap(
                     // To save CPU, I should NOT compute it if it's a hit.
                     // But I don't know if it's a hit until I check metadata.
                     // Checking metadata is cheap.
-                    
+
                     // If I want to support "Trust-but-Verify" in the future, I should compute it for *new* files.
                     if !is_cached_hit {
-                         entry.sparse_hash = compute_sparse_hash(&path, size).ok();
+                        entry.sparse_hash = compute_sparse_hash(&path, size).ok();
                     } else {
                         // Preserve old sparse hash if available?
-                         if let Some(old) = cached_entry_opt.and_then(|e| e.sparse_hash) {
-                             entry.sparse_hash = Some(old);
-                         }
+                        if let Some(old) = cached_entry_opt.and_then(|e| e.sparse_hash) {
+                            entry.sparse_hash = Some(old);
+                        }
                     }
 
                     if let Some(chunks) = chunks_info {
@@ -451,7 +466,7 @@ pub fn create_snap(
             }
             WorkerResult::Processed(pm) => {
                 total_raw_size += pm.metadata_info.size;
-                
+
                 if pm.is_cached_hit {
                     cache_hit_count += 1;
                 }
@@ -466,10 +481,10 @@ pub fn create_snap(
                     DataAction::WriteFile(hash_bytes) => {
                         let hash_hex = hex::encode(&hash_bytes);
                         // Double check blobs (though worker checked it)
-                         // Worker checked against shared map, but main thread writes.
-                         // It's possible another thread added it.
-                         // But for now trust worker's decision or check again?
-                         // DashMap is concurrent.
+                        // Worker checked against shared map, but main thread writes.
+                        // It's possible another thread added it.
+                        // But for now trust worker's decision or check again?
+                        // DashMap is concurrent.
                         if !written_blobs.contains_key(&hash_hex) {
                             pb.set_message(format!("Writing: {}", pm.path_str));
                             let blob_path = format!("blobs/{}", hash_hex);
@@ -505,7 +520,7 @@ pub fn create_snap(
                             }
                         }
                         if !any_written {
-                             dedup_count += 1;
+                            dedup_count += 1;
                         }
                     }
                 }
@@ -762,7 +777,7 @@ pub async fn send_streaming(
     let mut request = client
         .post(url)
         .header("Content-Length", file_size)
-        .header("User-Agent", "CodeTease-Vegh/0.3.0");
+        .header("User-Agent", "Vegh/0.3.0");
 
     if let Some(token) = auth_token {
         request = request.header("Authorization", format!("Bearer {}", token));
@@ -844,7 +859,7 @@ pub async fn send_chunked(
                     .header("X-File-Name", &filename)
                     .header("X-Chunk-Index", i.to_string())
                     .header("X-Total-Chunks", total_chunks.to_string())
-                    .header("User-Agent", "CodeTease-Vegh/0.3.0");
+                    .header("User-Agent", "Vegh/0.3.0");
 
                 if let Some(token) = &auth_token {
                     request = request.header("Authorization", format!("Bearer {}", token));

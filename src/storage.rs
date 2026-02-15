@@ -77,27 +77,27 @@ impl FileCacheEntry {
         if let Some(compressed) = &self.chunks_compressed {
             // Decompress zstd
             let decompressed = zstd::stream::decode_all(Cursor::new(compressed))?;
-            
+
             // Try to deserialize as Vec<StoredChunk>
             if let Ok(chunks) = bincode::deserialize::<Vec<StoredChunk>>(&decompressed) {
                 return Ok(Some(chunks));
             }
-            
+
             // Fallback for legacy format (Vec<[u8; 32]>)
             // If the buffer length is a multiple of 32, it *might* be the old format.
             // However, bincode serialization of Vec includes a length prefix (u64).
             // Old format: flat list of hashes [h1][h2]...
-            // Old format was just bytes. 
+            // Old format was just bytes.
             // In old code:
             // let flat: Vec<u8> = chunks.iter().flat_map(|c| c.iter()).copied().collect();
             // So it was just raw bytes concatenated.
-            
+
             // If we failed to deserialize as Vec<StoredChunk>, check if it looks like raw hashes
             if decompressed.len() % 32 == 0 {
                 // Return None to force re-computation/update
                 return Ok(None);
             }
-            
+
             Ok(None)
         } else {
             Ok(None)
@@ -149,10 +149,11 @@ impl CacheReader {
     pub fn get(&self, path: &str) -> Result<Option<FileCacheEntry>> {
         let txn = self.db.begin_read()?;
         if let Ok(table) = txn.open_table(TABLE_DATA_V3)
-            && let Some(v) = table.get(path)? {
-                let entry: FileCacheEntry = bincode::deserialize(v.value())?;
-                return Ok(Some(entry));
-            }
+            && let Some(v) = table.get(path)?
+        {
+            let entry: FileCacheEntry = bincode::deserialize(v.value())?;
+            return Ok(Some(entry));
+        }
         Ok(None)
     }
 
@@ -162,9 +163,10 @@ impl CacheReader {
         }
         let txn = self.db.begin_read()?;
         if let Ok(table) = txn.open_table(TABLE_INODES_V3)
-            && let Some(v) = table.get(inode)? {
-                return Ok(Some(v.value().to_string()));
-            }
+            && let Some(v) = table.get(inode)?
+        {
+            return Ok(Some(v.value().to_string()));
+        }
         Ok(None)
     }
 }
@@ -291,49 +293,50 @@ impl CacheDB {
     fn migrate_legacy_json(&mut self, path: &Path) -> Result<()> {
         println!("{} Migrating JSON cache to Embedded DB...", "📦".cyan());
         if let Ok(file) = File::open(path)
-            && let Ok(cache) = serde_json::from_reader::<_, LegacyVeghCache>(file) {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                let txn = self.txn.as_mut().unwrap();
+            && let Ok(cache) = serde_json::from_reader::<_, LegacyVeghCache>(file)
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let txn = self.txn.as_mut().unwrap();
 
-                let mut data = txn.open_table(TABLE_DATA_V3)?;
-                let mut inodes = txn.open_table(TABLE_INODES_V3)?;
+            let mut data = txn.open_table(TABLE_DATA_V3)?;
+            let mut inodes = txn.open_table(TABLE_INODES_V3)?;
 
-                for (k, v) in cache.files {
-                    let hash_bytes = v
-                        .hash
-                        .and_then(|h| hex::decode(h).ok())
-                        .and_then(|v| v.try_into().ok());
-                    let sparse_bytes = v
-                        .sparse_hash
-                        .and_then(|h| hex::decode(h).ok())
-                        .and_then(|v| v.try_into().ok());
+            for (k, v) in cache.files {
+                let hash_bytes = v
+                    .hash
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|v| v.try_into().ok());
+                let sparse_bytes = v
+                    .sparse_hash
+                    .and_then(|h| hex::decode(h).ok())
+                    .and_then(|v| v.try_into().ok());
 
-                    let new_entry = FileCacheEntry {
-                        size: v.size,
-                        modified: v.modified,
-                        inode: v.inode,
-                        ctime_sec: 0,
-                        ctime_nsec: 0,
-                        device_id: 0,
-                        last_seen: now,
-                        hash: hash_bytes,
-                        chunks_compressed: None,
-                        sparse_hash: sparse_bytes,
-                    };
+                let new_entry = FileCacheEntry {
+                    size: v.size,
+                    modified: v.modified,
+                    inode: v.inode,
+                    ctime_sec: 0,
+                    ctime_nsec: 0,
+                    device_id: 0,
+                    last_seen: now,
+                    hash: hash_bytes,
+                    chunks_compressed: None,
+                    sparse_hash: sparse_bytes,
+                };
 
-                    // Note: Legacy JSON didn't have offset/length for chunks, so we ignore chunks.
-                    // The cache will just recompute them next time.
+                // Note: Legacy JSON didn't have offset/length for chunks, so we ignore chunks.
+                // The cache will just recompute them next time.
 
-                    let bytes = bincode::serialize(&new_entry)?;
-                    data.insert(k.as_str(), bytes.as_slice())?;
-                    if new_entry.inode > 0 {
-                        inodes.insert(new_entry.inode, k.as_str())?;
-                    }
+                let bytes = bincode::serialize(&new_entry)?;
+                data.insert(k.as_str(), bytes.as_slice())?;
+                if new_entry.inode > 0 {
+                    inodes.insert(new_entry.inode, k.as_str())?;
                 }
             }
+        }
         let _ = fs::remove_file(path);
         Ok(())
     }
@@ -373,9 +376,10 @@ impl CacheDB {
                 for res in table.iter()? {
                     let (k, v) = res?;
                     if let Ok(entry) = bincode::deserialize::<FileCacheEntry>(v.value())
-                        && now.saturating_sub(entry.last_seen) >= retention_seconds {
-                            keys_to_remove.push((k.value().to_string(), entry.inode));
-                        }
+                        && now.saturating_sub(entry.last_seen) >= retention_seconds
+                    {
+                        keys_to_remove.push((k.value().to_string(), entry.inode));
+                    }
                 }
             }
         }

@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-/// 🥬 Vegh - The CodeTease Snapshot Tool
+/// 🥬 Vegh - The Snapshot Tool
 #[derive(Parser)]
-#[command(name = "vegh")]
+#[command(name = "vg")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -11,7 +11,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// 📸 Create a snapshot (.vegh)
+    /// Create a snapshot (.vegh)
     Snap {
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -29,17 +29,17 @@ pub enum Commands {
         #[arg(long)]
         no_cache: bool,
     },
-    /// 📦 Restore a snapshot
+    /// Restore a snapshot
     Restore {
         file: PathBuf,
         #[arg(default_value = ".")]
         out_dir: PathBuf,
     },
-    /// 📜 List files
+    /// List files
     List { file: PathBuf },
-    /// ✅ Verify integrity (Uses Blake3)
+    /// Verify integrity (Uses Blake3)
     Check { file: PathBuf },
-    /// 🚀 Send to server
+    /// Send to server
     Send {
         file: PathBuf,
         url: String,

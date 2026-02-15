@@ -4,6 +4,17 @@ version = "0.4.0"
 edition = "2024"
 authors = ["CodeTease"]
 description = "A lightweight, fast snapshot tool for developers."
+repository = "https://github.com/CodeTease/vegh"
+
+[package.metadata.wix]
+upgrade-guid = "6C767EAA-D193-4602-9300-3FCBC13B740B"
+path-guid = "D35F76C6-A8FA-4F40-BA1F-E513434F247B"
+license = false
+eula = false
+
+[[bin]]
+name = "vg"
+path = "src/main.rs"
 
 [dependencies]
 # CLI Parser
@@ -58,3 +69,8 @@ dashmap = "6.1.0"
 
 [dev-dependencies]
 tempfile = "3.24.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
